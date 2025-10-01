@@ -83,3 +83,40 @@ class BitgetClient:
     def close_all_positions(self, symbol):
         # Placeholder: implement real close logic by fetching positions.
         return {"note":"Implement actual position close logic for your account."}
+from fastapi import Query
+
+@app.get("/status")
+def status():
+    return {"ok": True, "env": ENV}
+
+@app.get("/positions")
+def positions(symbol: str = Query(..., description="e.g. BTCUSDT")):
+    try:
+        res = client.get_positions(symbol)
+        return {"ok": True, "data": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/orders/open")
+def orders_open(symbol: str = Query(...)):
+    try:
+        res = client.get_open_orders(symbol)
+        return {"ok": True, "data": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/orders/history")
+def orders_history(symbol: str = Query(...), limit: int = 50):
+    try:
+        res = client.get_order_history(symbol, pageSize=limit)
+        return {"ok": True, "data": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/fills")
+def fills(symbol: str = Query(...), limit: int = 50):
+    try:
+        res = client.get_fills(symbol, pageSize=limit)
+        return {"ok": True, "data": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
