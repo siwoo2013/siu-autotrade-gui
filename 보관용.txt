@@ -1,0 +1,59 @@
+환경변수 변경  파워쉘에서
+cd C:\tv_webhook_gui
+
+$env:WEBHOOK_SECRET="mysupersecret"
+$env:BITGET_API_KEY="bg_ee673f0bbfd0a97f33138b4c28b807ee"
+$env:BITGET_API_SECRET="ce7ee61424aca84dc90bde61cff6780000dd51e245507502ead70b26b6120f1d"
+$env:BITGET_API_PASSPHRASE="mino9431"
+$env:PRODUCT_TYPE="USDT-FUTURES"
+$env:MARGIN_COIN="USDT"
+# 모의거래
+$env:DRY_RUN="1"
+
+서버실행 파워쉘에서 닫으면 꺼짐  종료는 컨트롤+C
+uvicorn server:app --reload --port 8000
+
+------------------------------------------------------------
+
+bg_ee673f0bbfd0a97f33138b4c28b807ee
+
+ce7ee61424aca84dc90bde61cff6780000dd51e245507502ead70b26b6120f1d 
+
+gui 열기  새로운 파워쉘에서
+cd C:\tv_webhook_gui
+python gui.py
+
+
+git config user.name "siwoo2013"
+git config user.email "min9999min@gmail.com"
+
+REDACTED
+
+ 대쉬보드 들어가는방법
+👉 https://dashboard.render.com
+
+PC 파일폴더 C:\siwoo-projects\siu-autotrade-gui
+
+깃허브로 업데이트 할때 명령어
+작업 폴더로 이동
+cd C:\siwoo-projects\siu-autotrade-gui
+
+수정된 파일 확인(빨간색으로 modified 된 파일들이 보이면 정상)
+git status
+
+수정 파일 stage 올리기
+git add .
+
+커밋 메시지 달아서 커밋
+git commit -m "fix: 수정한 내용 간단히 설명"
+
+GitHub 원격 저장소로 push
+git push origin main
+
+
+
+바이 웹훅
+{"secret":"YOUR_WEBHOOK_SECRET","route":"order.reverse","exchange":"bitget","symbol":"{{ticker}}","target_side":"BUY","type":"MARKET","size":0.01}
+
+셀 웹훅
+{"secret":"YOUR_WEBHOOK_SECRET","route":"order.reverse","exchange":"bitget","symbol":"{{ticker}}","target_side":"SELL","type":"MARKET","size":0.01}
