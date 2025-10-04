@@ -136,3 +136,70 @@ class DemoExchange:
 
 # 전역 데모 인스턴스 (서버에서 import 하여 사용)
 DEMO = DemoExchange()
+# === bitget.py (파일 하단에 추가) ==================================
+import time
+import logging
+from typing import Optional, Union
+
+# 간단한 Net 포지션 메모리(데모용). 실거래 붙일 땐 삭제하고 실제 조회/주문으로 교체.
+_NET_POS = {}  # { "BTCUSDT": float }  # >0: 롱, <0: 숏, 0: 없음
+
+async def get_net_position_size(symbol: str) -> float:
+    """Net 모드 기준 현재 포지션 크기 반환. (롱=+, 숏=-, 없음=0)"""
+    return float(_NET_POS.get(symbol, 0.0))
+
+async def place_bitget_order(
+    symbol: str,
+    side: str,                 # "BUY" or "SELL"
+    order_type: str,           # "MARKET" or "LIMIT"
+    size: Union[float, str],
+    price: Optional[float] = None,
+    reduce_only: bool = False,
+    client_oid: Optional[str] = None,
+    note: Optional[str] = None,
+) -> str:
+    """데모용: 메모리상의 Net 포지션만 갱신. 실거래 시 Bitget REST 호출로 교체."""
+    oid = client_oid or f"demo-{int(time.time()*1000)}"
+    qty = 0.0 if size == "ALL" else float(size)
+    cur = _NET_POS.get(symbol, 0.0)
+
+    if reduce_only:
+        # 리듀스온리: 방향에 맞춰 포지션 줄이기만 (엄격 검사는 생략)
+        if side.upper() == "SELL":   # 보통 롱 감소
+            cur -= qty
+        else:                        # 보통 숏 감소
+            cur += qty
+    else:
+        # 신규/증가
+        if side.upper() == "BUY":
+            cur += qty
+        else:
+            cur -= qty
+
+    _NET_POS[symbol] = cur
+    logging.info(f"[DEMO] place_order {symbol} {side} {order_type} size={size} reduce_only={reduce_only} -> net={cur}")
+    return oid
+
+async def close_bitget_position(
+    symbol: str,
+    side: str,                      # 청산 시 반대 사이드로 들어오게 호출됨
+    size: Union[float, str] = "ALL",
+    client_oid: Optional[str] = None,
+) -> dict:
+    """데모용: 포지션 줄이거나 전량 플랫."""
+    cur = _NET_POS.get(symbol, 0.0)
+    if size == "ALL":
+        closed = abs(cur)
+        _NET_POS[symbol] = 0.0
+    else:
+        qty = float(size)
+        if side.upper() == "SELL":  # 보통 롱 줄이기
+            cur -= qty
+        else:                       # 보통 숏 줄이기
+            cur += qty
+        closed = qty
+        _NET_POS[symbol] = cur
+
+    logging.info(f"[DEMO] close_position {symbol} side={side} size={size} -> net={_NET_POS[symbol]}")
+    return {"symbol": symbol, "closed": closed}
+# ====================================================================
