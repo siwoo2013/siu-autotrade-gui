@@ -1,0 +1,6 @@
+regex:github_pat_[A-Za-z0-9_]{82}==>REDACTED
+regex:ghp_[A-Za-z0-9]{36}==>REDACTED
+regex:gho_[A-Za-z0-9]{36}==>REDACTED
+regex:ghu_[A-Za-z0-9]{36}==>REDACTED
+regex:ghs_[A-Za-z0-9]{36}==>REDACTED
+regex:ghr_[A-Za-z0-9]{36}==>REDACTED

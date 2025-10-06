@@ -4,22 +4,25 @@ import time
 import json
 import logging
 from typing import Optional, Union
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response  # ← 추가 (favicon 404 방지용)
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-# ===== Bitget 연동 함수 (bitget.py에 구현되어 있어야 함) =====
+# ===== Bitget 연동 함수 (bitget.py에 구현) =====
 from bitget import (
-    get_net_position_size,   # async def get_net_position_size(symbol) -> float (Net: 롱=+, 숏=-, 없음=0)
-    place_bitget_order,      # async def place_bitget_order(symbol, side, order_type, size, price=None, reduce_only=False, client_oid=None, note=None) -> str
-    close_bitget_position,   # async def close_bitget_position(symbol, side, size="ALL", client_oid=None) -> dict
+    get_net_position_size,   # async def get_net_position_size(symbol) -> float
+    place_bitget_order,      # async def place_bitget_order(...)
+    close_bitget_position,   # async def close_bitget_position(...)
 )
 
 # ===== FastAPI =====
 app = FastAPI()
 
-# ===== ENV & Logging =====
+# ===== 경로 & 로깅/환경 =====
+BASE_DIR = Path(__file__).resolve().parent
+
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -27,16 +30,16 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# ===== Utils =====
+# ===== 유틸 =====
 def normalize_symbol(tv_ticker: str) -> str:
     """
-    TradingView {{ticker}}를 Bitget 심볼로 정규화.
+    TradingView {{ticker}} -> Bitget 심볼 정규화
     예) BINANCE:BTCUSDT.P -> BTCUSDT
     """
     t = tv_ticker.split(":")[-1]
     return t.replace(".P", "").replace(".PERP", "")
 
-# ===== Payload Model =====
+# ===== 페이로드 모델 =====
 class ReversePayload(BaseModel):
     secret: str
     route: str = Field(..., description="order.reverse | order.create | order.close")
@@ -52,21 +55,30 @@ class ReversePayload(BaseModel):
     client_oid: Optional[str] = None
     note: Optional[str] = None
 
-# ===== Health (루트 405 방지) =====
+# ===== 헬스체크 =====
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"ok": True, "service": "siu-autotrade-gui"}
 
-# ===== Favicon 404 방지 =====
+# ===== Favicon 서빙 (루트/ 또는 static/ 에서 읽기) =====
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
-    # 아이콘 파일을 제공하지 않으므로 204로 응답
+    # 우선 루트 경로 favicon.ico
+    ico_path = BASE_DIR / "favicon.ico"
+    # 없으면 static/favicon.ico도 시도
+    if not ico_path.exists():
+        ico_path = BASE_DIR / "static" / "favicon.ico"
+    if ico_path.exists():
+        resp = FileResponse(ico_path, media_type="image/x-icon")
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+    # 파일이 없으면 204 No Content로
     return Response(status_code=204)
 
-# ===== Webhook =====
+# ===== Webhook 엔드포인트 =====
 @app.post("/tv")
 async def tv_webhook(request: Request):
-    # 1) JSON 파싱 (+로그에 원문 일부 남기기)
+    # 1) JSON 파싱
     try:
         body = await request.json()
     except Exception:
@@ -81,7 +93,7 @@ async def tv_webhook(request: Request):
         logging.error(f"[/tv] Schema error: {e}; body={json.dumps(body)[:500]}")
         raise HTTPException(400, f"Schema error: {e}")
 
-    # 3) secret 체크
+    # 3) 시크릿 체크
     if p.secret != WEBHOOK_SECRET:
         logging.warning("[/tv] Bad secret")
         raise HTTPException(401, "Bad secret")
@@ -92,11 +104,11 @@ async def tv_webhook(request: Request):
     cid = p.client_oid or f"tv-{int(time.time() * 1000)}"
     side_for_log = (p.target_side or body.get("side") or "-").upper()
 
-    # === 수신 요약 로그: BUY/SELL이 딱 보이게 ===
+    # 수신 로그 요약
     logging.info(f"[TV] 수신 | {symbol} | {route} | {side_for_log} | size={p.size}")
 
     # -------------------------------------------------
-    # A) Reverse: 같은방향 스킵 / 포지션없음 신규 / 반대면 청산후 리버스
+    # A) Reverse: 같은방향 스킵 / 포지션없음 신규 / 반대면 청산 후 리버스
     # -------------------------------------------------
     if route == "order.reverse":
         if p.target_side not in ("BUY", "SELL"):
@@ -110,7 +122,7 @@ async def tv_webhook(request: Request):
         order_type = (p.type or "MARKET").upper()
         size = float(p.size)
 
-        # 현재 포지션 조회 (Net 모드: >0 롱, <0 숏, 0 없음)
+        # 현재 순포지션 조회 (Net: >0 롱, <0 숏, 0 없음)
         try:
             net = await get_net_position_size(symbol)
         except Exception as e:
@@ -122,7 +134,7 @@ async def tv_webhook(request: Request):
         is_flat = (net == 0)
 
         if is_flat:
-            # 포지션 없음 → 신규 진입
+            # 신규 진입
             order_id = await place_bitget_order(
                 symbol=symbol,
                 side=target_side,
@@ -172,7 +184,7 @@ async def tv_webhook(request: Request):
         return {"ok": True, "state": "reverse", "order_id": order_id}
 
     # -------------------------------------------------
-    # B) (옵션) 기존 create/close 유지하고 싶을 때
+    # B) (옵션) order.create / order.close
     # -------------------------------------------------
     if route == "order.create":
         side = (p.target_side or body.get("side"))
@@ -202,7 +214,5 @@ async def tv_webhook(request: Request):
         logging.info(f"[TV] 처리완료 | {symbol} | close | side={side} | closed={closed}")
         return {"ok": True, "closed": closed}
 
-    # -------------------------------------------------
-    # Unknown route
-    # -------------------------------------------------
+    # 알 수 없는 route
     raise HTTPException(400, f"Unknown route: {route}")
