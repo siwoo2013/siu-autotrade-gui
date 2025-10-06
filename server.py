@@ -6,6 +6,7 @@ import logging
 from typing import Optional, Union
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import Response  # ← 추가 (favicon 404 방지용)
 from pydantic import BaseModel, Field
 
 # ===== Bitget 연동 함수 (bitget.py에 구현되어 있어야 함) =====
@@ -55,6 +56,12 @@ class ReversePayload(BaseModel):
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"ok": True, "service": "siu-autotrade-gui"}
+
+# ===== Favicon 404 방지 =====
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    # 아이콘 파일을 제공하지 않으므로 204로 응답
+    return Response(status_code=204)
 
 # ===== Webhook =====
 @app.post("/tv")
