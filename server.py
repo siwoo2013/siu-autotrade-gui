@@ -1,218 +1,156 @@
-# server.py
 import os
-import time
-import json
-import logging
-from typing import Optional, Union
+import re
 from pathlib import Path
-
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ValidationError
+from typing import Optional
 
-# ===== Bitget 연동 함수 (bitget.py에 구현) =====
-from bitget import (
-    get_net_position_size,   # async def get_net_position_size(symbol) -> float
-    place_bitget_order,      # async def place_bitget_order(...)
-    close_bitget_position,   # async def close_bitget_position(...)
-)
+from bitget import BitgetClient, PositionState
 
-# ===== FastAPI =====
-app = FastAPI()
-
-# ===== 경로 & 로깅/환경 =====
+APP_NAME = "siu-autotrade-gui"
 BASE_DIR = Path(__file__).resolve().parent
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+# ===== Env & mode ============================================================
+DEMO = (os.getenv("DEMO", "true").lower() in ["1", "true", "yes", "on"]) or (
+    os.getenv("TRADE_MODE", "demo").lower() != "live"
 )
+MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
 
-# ===== 유틸 =====
-def normalize_symbol(tv_ticker: str) -> str:
-    """
-    TradingView {{ticker}} -> Bitget 심볼 정규화
-    예) BINANCE:BTCUSDT.P -> BTCUSDT
-    """
-    t = tv_ticker.split(":")[-1]
-    return t.replace(".P", "").replace(".PERP", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
 
-# ===== 페이로드 모델 =====
-class ReversePayload(BaseModel):
-    secret: str
-    route: str = Field(..., description="order.reverse | order.create | order.close")
-    exchange: str = "bitget"
-    symbol: str
-    # reverse 용
-    target_side: Optional[str] = Field(None, description="BUY or SELL")
-    # 공통
-    type: Optional[str] = Field("MARKET", description="MARKET or LIMIT")
-    size: Optional[Union[float, str]] = Field(None, description='float or "ALL"')
-    price: Optional[float] = None
-    reduce_only: Optional[bool] = False
-    client_oid: Optional[str] = None
-    note: Optional[str] = None
+# ===== FastAPI ===============================================================
+app = FastAPI(title=APP_NAME)
 
-# ===== 헬스체크 =====
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return {"ok": True, "service": "siu-autotrade-gui"}
-
-# ===== Favicon 서빙 (루트/ 또는 static/ 에서 읽기) =====
+# ===== Static: favicon =======================================================
 @app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    # 우선 루트 경로 favicon.ico
-    ico_path = BASE_DIR / "favicon.ico"
-    # 없으면 static/favicon.ico도 시도
-    if not ico_path.exists():
-        ico_path = BASE_DIR / "static" / "favicon.ico"
-    if ico_path.exists():
-        resp = FileResponse(ico_path, media_type="image/x-icon")
+def get_favicon():
+    ico = BASE_DIR / "favicon.ico"
+    if ico.exists():
+        resp = FileResponse(ico, media_type="image/x-icon")
         resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return resp
-    # 파일이 없으면 204 No Content로
     return Response(status_code=204)
 
-# ===== Webhook 엔드포인트 =====
+@app.head("/favicon.ico", include_in_schema=False)
+def head_favicon():
+    ico = BASE_DIR / "favicon.ico"
+    if ico.exists():
+        headers = {
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Type": "image/x-icon",
+            "Content-Length": str(ico.stat().st_size),
+        }
+        return Response(status_code=200, headers=headers)
+    return Response(status_code=204)
+
+# ===== Helpers ===============================================================
+TV_TICKER_RE = re.compile(r"^[A-Z0-9]+:([A-Z0-9]+)(?:\.[A-Z0-9]+)?$")
+
+def normalize_symbol(tv_symbol: str) -> str:
+    """
+    TV: 'BINANCE:BTCUSDT.P' -> 'BTCUSDT'
+    """
+    m = TV_TICKER_RE.match(tv_symbol)
+    return m.group(1) if m else tv_symbol
+
+def log(msg: str):
+    print(f"{MODE_TAG} {msg}", flush=True)
+
+# ===== Bitget Client =========================================================
+bg_client = BitgetClient(
+    api_key=os.getenv("BITGET_API_KEY", ""),
+    api_secret=os.getenv("BITGET_API_SECRET", ""),
+    passphrase=os.getenv("BITGET_API_PASSPHRASE", ""),
+    base_url=os.getenv("BITGET_BASE_URL", "https://api.bitget.com"),
+    demo=DEMO,
+)
+
+# ===== Request Model =========================================================
+class TvWebhook(BaseModel):
+    secret: Optional[str] = None
+    route: str
+    exchange: str
+    symbol: str
+    target_side: Optional[str] = None  # BUY | SELL (for order.reverse)
+    type: Optional[str] = "MARKET"
+    size: Optional[float] = None       # e.g., 0.01
+    side: Optional[str] = None         # for order.close
+    client_oid: Optional[str] = None
+
+# ===== Root ==================================================================
+@app.get("/", include_in_schema=False)
+def root():
+    return JSONResponse({"ok": True, "service": APP_NAME, "mode": "demo" if DEMO else "live"})
+
+# ===== TradingView Webhook ====================================================
 @app.post("/tv")
 async def tv_webhook(request: Request):
-    # 1) JSON 파싱
+    # 1) Parse JSON
     try:
         body = await request.json()
     except Exception:
-        raw = (await request.body()).decode("utf-8", "ignore")
-        logging.error(f"[/tv] Invalid JSON RAW: {raw[:500]}")
-        raise HTTPException(400, "Invalid JSON")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 2) 스키마 검증
     try:
-        p = ReversePayload(**body)
-    except Exception as e:
-        logging.error(f"[/tv] Schema error: {e}; body={json.dumps(body)[:500]}")
-        raise HTTPException(400, f"Schema error: {e}")
+        data = TvWebhook(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-    # 3) 시크릿 체크
-    if p.secret != WEBHOOK_SECRET:
-        logging.warning("[/tv] Bad secret")
-        raise HTTPException(401, "Bad secret")
+    # 2) Secret check
+    if WEBHOOK_SECRET and (data.secret or "") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Bad secret")
 
-    # 4) 공통 준비
-    symbol = normalize_symbol(p.symbol)
-    route = p.route
-    cid = p.client_oid or f"tv-{int(time.time() * 1000)}"
-    side_for_log = (p.target_side or body.get("side") or "-").upper()
+    # 3) Normalize inputs
+    tv_symbol = data.symbol
+    symbol = normalize_symbol(tv_symbol)
+    route = data.route.lower().strip()
+    order_type = (data.type or "MARKET").upper()
+    size = float(data.size) if data.size is not None else None
+    target_side = (data.target_side or "").upper()
+    client_oid = data.client_oid
 
-    # 수신 로그 요약
-    logging.info(f"[TV] 수신 | {symbol} | {route} | {side_for_log} | size={p.size}")
+    log(f"[TV] 수신 | {symbol} | {route} | {target_side or data.side} | size={size}")
 
-    # -------------------------------------------------
-    # A) Reverse: 같은방향 스킵 / 포지션없음 신규 / 반대면 청산 후 리버스
-    # -------------------------------------------------
+    # 4) Routing
     if route == "order.reverse":
-        if p.target_side not in ("BUY", "SELL"):
-            raise HTTPException(400, "target_side must be BUY or SELL")
-        if p.size is None:
-            raise HTTPException(400, "size is required for reverse")
-        if isinstance(p.size, str):
-            raise HTTPException(400, 'size must be a number (e.g., 0.01), not "ALL"')
+        if order_type != "MARKET":
+            raise HTTPException(status_code=400, detail="Only MARKET supported")
+        if target_side not in ["BUY", "SELL"]:
+            raise HTTPException(status_code=400, detail="target_side must be BUY or SELL")
+        if size is None or size <= 0:
+            raise HTTPException(status_code=400, detail="size must be > 0")
 
-        target_side = p.target_side
-        order_type = (p.type or "MARKET").upper()
-        size = float(p.size)
+        # 현재 포지션 조회
+        pos = bg_client.get_net_position(symbol)
 
-        # 현재 순포지션 조회 (Net: >0 롱, <0 숏, 0 없음)
-        try:
-            net = await get_net_position_size(symbol)
-        except Exception as e:
-            logging.exception("[/tv] position query failed")
-            raise HTTPException(500, f"position query failed: {e}")
+        # 같은 방향 스킵
+        if (pos == PositionState.LONG and target_side == "BUY") or \
+           (pos == PositionState.SHORT and target_side == "SELL"):
+            log(f"[TV] 처리완료 | {symbol} | reverse | state=same-direction-skip")
+            return JSONResponse({"ok": True, "state": "same-direction-skip"})
 
-        want_long = (target_side == "BUY")
-        is_long = (net > 0)
-        is_flat = (net == 0)
+        # 반대 포지션 리버스
+        if (pos == PositionState.LONG and target_side == "SELL") or \
+           (pos == PositionState.SHORT and target_side == "BUY"):
+            # 전량 청산
+            close_side = "SELL" if pos == PositionState.LONG else "BUY"
+            bg_client.close_position(symbol, close_side, client_oid=client_oid)
 
-        if is_flat:
-            # 신규 진입
-            order_id = await place_bitget_order(
-                symbol=symbol,
-                side=target_side,
-                order_type=order_type,
-                size=size,
-                price=None,
-                reduce_only=False,
-                client_oid=f"{cid}-open",
-                note=p.note or "reverse-open",
-            )
-            logging.info(f"[TV] 처리완료 | {symbol} | reverse | state=flat->open | oid={order_id}")
-            return {"ok": True, "state": "flat->open", "order_id": order_id}
+        # 신규 진입
+        oid = bg_client.place_market_order(symbol, target_side, size, reduce_only=False, client_oid=client_oid)
+        state = "flat->open" if pos == PositionState.FLAT else "reverse"
+        log(f"[TV] 처리완료 | {symbol} | reverse | state={state} | oid={oid}")
+        return JSONResponse({"ok": True, "state": state, "order_id": oid})
 
-        if is_long == want_long:
-            # 같은 방향 → 스킵
-            logging.info(f"[TV] 처리완료 | {symbol} | reverse | state=same-direction-skip")
-            return {"ok": True, "state": "same-direction-skip"}
+    elif route == "order.close":
+        # 전량 청산
+        side = (data.side or "").upper()
+        if side not in ["BUY", "SELL"]:
+            raise HTTPException(status_code=400, detail="side must be BUY or SELL")
+        bg_client.close_position(symbol, side, client_oid=client_oid)
+        log(f"[TV] 처리완료 | {symbol} | close | side={side}")
+        return JSONResponse({"ok": True, "state": "close"})
 
-        # 반대 포지션 → 전량 청산 후 신규
-        try:
-            await close_bitget_position(
-                symbol=symbol,
-                side=("SELL" if is_long else "BUY"),
-                size="ALL",
-                client_oid=f"{cid}-close",
-            )
-        except Exception as e:
-            logging.exception("[/tv] close failed")
-            raise HTTPException(500, f"close failed: {e}")
-
-        try:
-            order_id = await place_bitget_order(
-                symbol=symbol,
-                side=target_side,
-                order_type=order_type,
-                size=size,
-                price=None,
-                reduce_only=False,
-                client_oid=f"{cid}-open",
-                note=p.note or "reverse-open",
-            )
-        except Exception as e:
-            logging.exception("[/tv] open failed")
-            raise HTTPException(500, f"open failed: {e}")
-
-        logging.info(f"[TV] 처리완료 | {symbol} | reverse | state=reverse | oid={order_id}")
-        return {"ok": True, "state": "reverse", "order_id": order_id}
-
-    # -------------------------------------------------
-    # B) (옵션) order.create / order.close
-    # -------------------------------------------------
-    if route == "order.create":
-        side = (p.target_side or body.get("side"))
-        if not (side and p.size and p.type):
-            raise HTTPException(400, "missing fields for order.create (need side, size, type)")
-        order_id = await place_bitget_order(
-            symbol=symbol,
-            side=side,
-            order_type=(p.type or "MARKET").upper(),
-            size=(float(p.size) if p.size != "ALL" else p.size),
-            price=p.price,
-            reduce_only=bool(p.reduce_only),
-            client_oid=cid,
-            note=p.note,
-        )
-        logging.info(f"[TV] 처리완료 | {symbol} | create | side={side} | oid={order_id}")
-        return {"ok": True, "order_id": order_id}
-
-    if route == "order.close":
-        side = body.get("side") or "SELL"
-        closed = await close_bitget_position(
-            symbol=symbol,
-            side=side,
-            size=p.size or "ALL",
-            client_oid=f"{cid}-close",
-        )
-        logging.info(f"[TV] 처리완료 | {symbol} | close | side={side} | closed={closed}")
-        return {"ok": True, "closed": closed}
-
-    # 알 수 없는 route
-    raise HTTPException(400, f"Unknown route: {route}")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown route: {route}")

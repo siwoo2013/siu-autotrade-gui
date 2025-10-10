@@ -1,205 +1,148 @@
-# bitget.py
-from __future__ import annotations
+import os
 import time
-import uuid
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+import hmac
+import json
+import hashlib
+import base64
+from enum import Enum
+from typing import Optional, Dict, Any
+
+import requests
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+class PositionState(str, Enum):
+    FLAT = "flat"
+    LONG = "long"
+    SHORT = "short"
 
 
-@dataclass
-class Order:
-    id: str
-    client_oid: Optional[str]
-    ts: int
-    symbol: str
-    side: str           # BUY / SELL
-    type: str           # MARKET / LIMIT
-    size: float
-    price: Optional[float] = None
-    reduce_only: bool = False
-    status: str = "open"  # open / filled / canceled
-    note: Optional[str] = None
-
-
-@dataclass
-class Fill:
-    id: str
-    order_id: str
-    ts: int
-    symbol: str
-    side: str
-    size: float
-    price: float
-
-
-class DemoExchange:
+class BitgetClient:
     """
-    매우 간단한 모의 거래 엔진 (메모리 기반)
-    - 마크가격(DEMO_MARK_PRICE)을 기준으로 마켓주문은 즉시 체결
-    - 리밋주문은 등록만 하고 체결은 하지 않음(조회/취소만 가능)
-    - 포지션: size만 관리(+롱/-숏)
+    - demo=True  : 실호출 대신 로그만 남기고 성공 시뮬레이션
+    - demo=False : Bitget REST LIVE 호출
     """
-    def __init__(self, mark_price: float = 100.0):
-        self.mark_price = mark_price
-        self.positions: Dict[str, float] = {}      # symbol -> size(+롱 / -숏)
-        self.orders: Dict[str, Order] = {}         # id -> Order
-        self.fills: List[Fill] = []
+    def __init__(self, api_key: str, api_secret: str, passphrase: str,
+                 base_url: str = "https://api.bitget.com", demo: bool = True):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self.base_url = base_url.rstrip("/")
+        self.demo = demo
+        self.session = requests.Session()
+        # 기본 마진코인(USDT-M Perp)
+        self.margin_coin = "USDT"
 
-    # ---- helpers ----
-    def _new_id(self, prefix: str) -> str:
-        return f"{prefix}-{uuid.uuid4().hex[:16]}"
+    # ===== Helpers ============================================================
+    def _ts(self) -> str:
+        # Bitget는 밀리초 타임스탬프 문자열 요구
+        return str(int(time.time() * 1000))
 
-    def _mk_price(self) -> float:
-        return float(self.mark_price)
+    def _sign(self, ts: str, method: str, path: str, body: str) -> str:
+        msg = ts + method.upper() + path + body
+        mac = hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+        return base64.b64encode(mac).decode()
 
-    # ---- public API ----
-    def place_market_order(
-        self, *, symbol: str, side: str, size: float, reduce_only: bool = False,
-        client_oid: Optional[str] = None
-    ) -> Dict:
-        oid = self._new_id("mkt")
-        price = self._mk_price()
-        ts = now_ms()
-        order = Order(
-            id=oid, client_oid=client_oid, ts=ts, symbol=symbol, side=side.upper(),
-            type="MARKET", size=float(size), price=price, reduce_only=reduce_only, status="filled"
-        )
-        self.orders[oid] = order
-
-        # 체결 기록
-        fill = Fill(id=self._new_id("fill"), order_id=oid, ts=ts, symbol=symbol,
-                    side=side.upper(), size=float(size), price=price)
-        self.fills.append(fill)
-
-        # 포지션 반영
-        pos = self.positions.get(symbol, 0.0)
-        delta = size if side.upper() == "BUY" else -size
-        if reduce_only:
-            # 반대 방향으로만 줄이기
-            if pos * delta < 0:
-                new_pos = pos + delta
-                # reduce_only인데 방향이 늘어나는 경우 0까지만 줄임
-                if (pos > 0 and new_pos > 0) or (pos < 0 and new_pos < 0):
-                    new_pos = 0.0
-                self.positions[symbol] = new_pos
-        else:
-            self.positions[symbol] = pos + delta
-
+    def _headers(self, ts: str, sign: str) -> Dict[str, str]:
         return {
-            "order": asdict(order),
-            "fill": asdict(fill),
-            "position": {"symbol": symbol, "size": self.positions.get(symbol, 0.0)}
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "Content-Type": "application/json",
         }
 
-    def place_limit_order(
-        self, *, symbol: str, side: str, size: float, price: float,
-        reduce_only: bool = False, client_oid: Optional[str] = None, note: Optional[str] = None
-    ) -> Dict:
-        oid = self._new_id("lmt")
-        ts = now_ms()
-        order = Order(
-            id=oid, client_oid=client_oid, ts=ts, symbol=symbol, side=side.upper(),
-            type="LIMIT", size=float(size), price=float(price),
-            reduce_only=reduce_only, status="open", note=note
-        )
-        self.orders[oid] = order
-        return {"order": asdict(order)}
-
-    def close_all_positions(self, *, symbol: str) -> Dict:
-        pos = self.positions.get(symbol, 0.0)
-        if pos == 0:
-            return {"ok": True, "message": "no position"}
-        side = "SELL" if pos > 0 else "BUY"
-        result = self.place_market_order(symbol=symbol, side=side, size=abs(pos), reduce_only=True)
-        return {"ok": True, "result": result}
-
-    # ---- queries ----
-    def get_positions(self, symbol: str) -> Dict:
-        return {"symbol": symbol, "size": self.positions.get(symbol, 0.0)}
-
-    def get_open_orders(self, symbol: str) -> List[Dict]:
-        return [asdict(o) for o in self.orders.values()
-                if o.symbol == symbol and o.status == "open"]
-
-    def get_order_history(self, symbol: str, pageSize: int = 50) -> List[Dict]:
-        return [asdict(o) for o in list(self.orders.values())[::-1]
-                if o.symbol == symbol][:pageSize]
-
-    def get_fills(self, symbol: str, pageSize: int = 50) -> List[Dict]:
-        return [asdict(f) for f in list(self.fills)[::-1]
-                if f.symbol == symbol][:pageSize]
-
-
-# 전역 데모 인스턴스 (서버에서 import 하여 사용)
-DEMO = DemoExchange()
-# === bitget.py (파일 하단에 추가) ==================================
-import time
-import logging
-from typing import Optional, Union
-
-# 간단한 Net 포지션 메모리(데모용). 실거래 붙일 땐 삭제하고 실제 조회/주문으로 교체.
-_NET_POS = {}  # { "BTCUSDT": float }  # >0: 롱, <0: 숏, 0: 없음
-
-async def get_net_position_size(symbol: str) -> float:
-    """Net 모드 기준 현재 포지션 크기 반환. (롱=+, 숏=-, 없음=0)"""
-    return float(_NET_POS.get(symbol, 0.0))
-
-async def place_bitget_order(
-    symbol: str,
-    side: str,                 # "BUY" or "SELL"
-    order_type: str,           # "MARKET" or "LIMIT"
-    size: Union[float, str],
-    price: Optional[float] = None,
-    reduce_only: bool = False,
-    client_oid: Optional[str] = None,
-    note: Optional[str] = None,
-) -> str:
-    """데모용: 메모리상의 Net 포지션만 갱신. 실거래 시 Bitget REST 호출로 교체."""
-    oid = client_oid or f"demo-{int(time.time()*1000)}"
-    qty = 0.0 if size == "ALL" else float(size)
-    cur = _NET_POS.get(symbol, 0.0)
-
-    if reduce_only:
-        # 리듀스온리: 방향에 맞춰 포지션 줄이기만 (엄격 검사는 생략)
-        if side.upper() == "SELL":   # 보통 롱 감소
-            cur -= qty
-        else:                        # 보통 숏 감소
-            cur += qty
-    else:
-        # 신규/증가
-        if side.upper() == "BUY":
-            cur += qty
+    def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = self.base_url + path
+        payload = json.dumps(body or {}, separators=(",", ":"))
+        ts = self._ts()
+        sign = self._sign(ts, method, path, payload if method != "GET" else "")
+        headers = self._headers(ts, sign)
+        if method == "GET":
+            resp = self.session.get(url, headers=headers, params=body or {}, timeout=10)
         else:
-            cur -= qty
+            resp = self.session.request(method, url, headers=headers, data=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") not in ("00000", 0, "0", None):
+            raise RuntimeError(f"Bitget error: {data}")
+        return data
 
-    _NET_POS[symbol] = cur
-    logging.info(f"[DEMO] place_order {symbol} {side} {order_type} size={size} reduce_only={reduce_only} -> net={cur}")
-    return oid
+    def _log(self, msg: str):
+        tag = "[DEMO]" if self.demo else "[LIVE]"
+        print(f"{tag} {msg}", flush=True)
 
-async def close_bitget_position(
-    symbol: str,
-    side: str,                      # 청산 시 반대 사이드로 들어오게 호출됨
-    size: Union[float, str] = "ALL",
-    client_oid: Optional[str] = None,
-) -> dict:
-    """데모용: 포지션 줄이거나 전량 플랫."""
-    cur = _NET_POS.get(symbol, 0.0)
-    if size == "ALL":
-        closed = abs(cur)
-        _NET_POS[symbol] = 0.0
-    else:
-        qty = float(size)
-        if side.upper() == "SELL":  # 보통 롱 줄이기
-            cur -= qty
-        else:                       # 보통 숏 줄이기
-            cur += qty
-        closed = qty
-        _NET_POS[symbol] = cur
+    # ===== Public =============================================================
+    def get_net_position(self, symbol: str) -> PositionState:
+        """
+        LIVE: 단일 심볼 포지션 조회
+        DEMO: 항상 FLAT로 시작, 내부 상태 없이 '거래 기록'에 의존하지 않고 서버 로직에서 reverse/skip 판단 가능.
+        """
+        if self.demo:
+            # 데모에서는 서버 로직에서 same-direction-skip / reverse 등 판단 로그만 찍고
+            # 체결 영향은 없으니, 여기서는 거래소 조회 생략
+            return PositionState.FLAT
 
-    logging.info(f"[DEMO] close_position {symbol} side={side} size={size} -> net={_NET_POS[symbol]}")
-    return {"symbol": symbol, "closed": closed}
-# ====================================================================
+        # Bitget 단일 포지션 조회 (USDT-M)
+        path = "/api/mix/v1/position/singlePosition"
+        params = {"symbol": symbol, "marginCoin": self.margin_coin}
+        data = self._request("GET", path, params)
+
+        pos_data = (data.get("data") or {})
+        if not pos_data:
+            return PositionState.FLAT
+
+        holdSide = (pos_data.get("holdSide") or "").lower()  # long|short|none
+        if holdSide == "long":
+            return PositionState.LONG
+        if holdSide == "short":
+            return PositionState.SHORT
+        return PositionState.FLAT
+
+    def place_market_order(self, symbol: str, side: str, size: float,
+                           reduce_only: bool = False, client_oid: Optional[str] = None) -> str:
+        """
+        LIVE: 시장가 주문
+        DEMO: 로깅만
+        """
+        side = side.upper()  # BUY|SELL
+
+        if self.demo:
+            self._log(f"place_order {symbol} {side} MARKET size={size} reduce_only={reduce_only} -> net=~0.0")
+            return f"tv-{int(time.time()*1000)}-open"
+
+        path = "/api/mix/v1/order/placeOrder"
+        body = {
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "size": str(size),
+            "side": "open_long" if side == "BUY" else "open_short",
+            "orderType": "market",
+            "reduceOnly": reduce_only,
+        }
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        data = self._request("POST", path, body)
+        oid = (data.get("data") or {}).get("orderId") or f"tv-{int(time.time()*1000)}-open"
+        self._log(f"place_order {symbol} {side} MARKET size={size} reduce_only={reduce_only} -> oid={oid}")
+        return oid
+
+    def close_position(self, symbol: str, side: str, client_oid: Optional[str] = None) -> None:
+        """
+        LIVE: 전량 청산 (side 기준은 '무엇으로 청산하나' BUY/SELL)
+        DEMO: 로깅만
+        """
+        side = side.upper()
+
+        if self.demo:
+            self._log(f"close_position {symbol} side={side} size=ALL -> net=0.0")
+            return
+
+        path = "/api/mix/v1/order/closeAllPositions"
+        # Bitget은 심볼/마진코인만 주면 전량 청산 가능(포지션 방향은 거래소가 판단)
+        body = {
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+        }
+        data = self._request("POST", path, body)
+        self._log(f"close_position {symbol} side={side} size=ALL -> done")
