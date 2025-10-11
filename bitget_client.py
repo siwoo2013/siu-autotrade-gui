@@ -8,6 +8,7 @@ import json
 import hashlib
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -18,12 +19,13 @@ log.setLevel(logging.INFO)
 
 class BitgetClient:
     """
-    Bitget Mix(USDT-M) 선물 전용 경량 클라이언트.
+    Bitget USDT-M(UMCBL) 원웨이 모드 전용 경량 클라이언트.
 
-    - 기본 One-way 모드('buy'/'sell' + reduceOnly 플래그)로 주문
+    - 신규 진입: side = "BUY"/"SELL", reduceOnly=False
+    - 청산    : side = "BUY"/"SELL", reduceOnly=True
     - 400172(side mismatch) 발생 시:
-        * 원웨이 전제에서 반대 방향 + reduceOnly=True 로 강제 청산 실행
-        * 그 후 원래 주문(신규 진입) 재시도
+        * 신규(open, reduceOnly=False)라면 반대방향 reduceOnly=True로 강제 청산 후, 다시 신규 시도
+        * 청산(reduceOnly=True)에서 난 경우엔 포지션이 없다고 보고 같은 방향 신규(open)로 전환
     """
 
     def __init__(
@@ -32,9 +34,9 @@ class BitgetClient:
         api_secret: str,
         passphrase: str,
         *,
-        demo: bool = False,
+        demo: bool = False,                 # 현재는 실제/데모 URL 동일, 키만 다르게 사용
         margin_coin: str = "USDT",
-        product_type: str = "umcbl",  # USDT-M perpetual
+        product_type: str = "umcbl",        # USDT-M perpetual
         base_url: str = "https://api.bitget.com",
         session: Optional[requests.Session] = None,
     ) -> None:
@@ -52,11 +54,12 @@ class BitgetClient:
         except Exception as e:
             log.warning("Bitget time sync failed (will retry on demand): %s", e)
 
-    # ---- 시간 & 서명 -------------------------------------------------------
+    # ---- 시간/서명 --------------------------------------------------------
     def _ts_ms(self) -> int:
         return int(time.time() * 1000) + self._delta_ms
 
     def sync_time(self) -> None:
+        # v2 time 엔드포인트 (권장)
         url = f"{self.base_url}/api/v2/public/time"
         r = self.session.get(url, timeout=10)
         r.raise_for_status()
@@ -83,7 +86,7 @@ class BitgetClient:
             "X-CHANNEL-API-CODE": "PY",
         }
 
-    # ---- 요청 공통 ---------------------------------------------------------
+    # ---- 공통 요청 --------------------------------------------------------
     def _request(
         self,
         method: str,
@@ -96,28 +99,22 @@ class BitgetClient:
         url = f"{self.base_url}{path}"
         params = params or {}
         body = body or {}
-
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
 
-        # request_path (서명용)
         query = ""
         if params:
-            from urllib.parse import urlencode
             query = "?" + urlencode(params, doseq=True)
 
         ts = str(self._ts_ms())
         sign = self._sign(ts, method, f"{path}{query}", body_str)
         headers = self._headers(ts, sign)
 
-        try:
-            if method.upper() == "GET":
-                resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
-            elif method.upper() == "POST":
-                resp = self.session.post(url, headers=headers, params=params, data=body_str, timeout=timeout)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-        except requests.RequestException:
-            raise
+        if method.upper() == "GET":
+            resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
+        elif method.upper() == "POST":
+            resp = self.session.post(url, headers=headers, params=params, data=body_str, timeout=timeout)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
 
         try:
             resp.raise_for_status()
@@ -142,7 +139,7 @@ class BitgetClient:
             raise requests.HTTPError(f"Bitget logical error: {data}")
         return data
 
-    # ---- 포지션 ------------------------------------------------------------
+    # ---- 포지션 -----------------------------------------------------------
     def get_net_position(self, symbol: str) -> Dict[str, float]:
         path = "/api/mix/v1/position/singlePosition"
         params = {
@@ -157,97 +154,84 @@ class BitgetClient:
         if isinstance(d, list):
             for p in d:
                 try:
-                    hold_side = (p.get("holdSide") or "").lower()
-                    sz = float(p.get("total", p.get("available", p.get("openAmount", 0))) or 0)
-                    if hold_side == "long":
+                    side = (p.get("holdSide") or "").lower()
+                    sz = float(p.get("total", p.get("available", p.get("openAmount", 0)) or 0))
+                    if side == "long":
                         net += sz
-                    elif hold_side == "short":
+                    elif side == "short":
                         net -= sz
                 except Exception:
                     continue
         elif isinstance(d, dict):
             try:
-                hold_side = (d.get("holdSide") or "").lower()
-                sz = float(d.get("total", d.get("available", d.get("openAmount", 0))) or 0)
-                if hold_side == "long":
+                side = (d.get("holdSide") or "").lower()
+                sz = float(d.get("total", d.get("available", d.get("openAmount", 0)) or 0))
+                if side == "long":
                     net += sz
-                elif hold_side == "short":
+                elif side == "short":
                     net -= sz
             except Exception:
                 pass
 
         return {"net": net}
 
-    # ---- 주문 --------------------------------------------------------------
+    # ---- 주문(원웨이) ------------------------------------------------------
     @staticmethod
-    def _opp(side: str) -> str:
-        return "sell" if side.lower() == "buy" else "buy"
+    def _norm_side(side: str) -> str:
+        s = side.strip().lower()
+        # 혹시 헤지 표현이 들어오면 보정
+        m = {"open_long": "buy", "close_long": "sell", "open_short": "sell", "close_short": "buy"}
+        return m.get(s, s)
 
-# --- BitgetClient class 내부에 추가 ---
-
-def place_order(
-    self,
-    symbol: str,
-    side: str,              # "BUY" | "SELL" (서버에서 대문자로 들어옴)
-    type: str,              # "MARKET" | "LIMIT" (현재는 MARKET만 사용)
-    size,                   # 수량 (문자열/숫자 허용)
-    reduce_only: bool = False,
-    client_oid: str | None = None,
-):
-    """
-    One-way 모드 기준:
-      - 오픈:  side = "BUY"  -> 'buy',  reduceOnly=False
-              side = "SELL" -> 'sell', reduceOnly=False
-      - 청산:  side = "BUY"  -> 'buy',  reduceOnly=True  (숏 청산)
-              side = "SELL" -> 'sell', reduceOnly=True  (롱 청산)
-
-    서버(server.py)가 포지션 방향(net) 보고 reduce_only True/False를 결정해 호출합니다.
-    """
-    side_norm = side.strip().lower()
-    if side_norm not in ("buy", "sell"):
-        # 혹시 "open_long/open_short/close_long/close_short"가 들어오면 보정
-        m = {
-            "open_long":  "buy",
-            "open_short": "sell",
-            "close_long": "sell",
-            "close_short":"buy",
+    def _body(self, symbol: str, side: str, order_type: str, size, reduce_only: bool, client_oid: str | None):
+        return {
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
+            "side": side,                         # "buy" | "sell"
+            "orderType": order_type,              # "market"
+            "size": str(size),
+            "reduceOnly": bool(reduce_only),
+            **({"clientOid": client_oid} if client_oid else {}),
         }
-        side_norm = m.get(side_norm, side_norm)
 
-    order_type = type.strip().lower()  # "market" | "limit" (우린 market)
-    body = {
-        "symbol": symbol,                 # 예: BTCUSDT_UMCBL (서버에서 매핑)
-        "marginCoin": "USDT",
-        "productType": self.product_type, # "umcbl"
-        "side": side_norm,                # "buy" | "sell"
-        "orderType": order_type,          # "market"
-        "size": str(size),
-        "reduceOnly": bool(reduce_only),
-    }
-    if client_oid:
-        body["clientOid"] = client_oid
+    def place_order(
+        self,
+        symbol: str,
+        side: str,               # "BUY" | "SELL" (대소문자 무관)
+        type: str,               # "MARKET" | "LIMIT" -> 현재 MARKET 사용
+        size,
+        reduce_only: bool = False,
+        client_oid: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        원웨이 모드용 주문. 기본은 'buy'/'sell' + reduceOnly 플래그만 사용.
+        side mismatch(400172) 대응 포함.
+        """
+        side_norm = self._norm_side(side)
+        order_type = type.strip().lower()
+        path = "/api/mix/v1/order/placeOrder"
 
-    path = "/api/mix/v1/order/placeOrder"
-    return self._request("POST", path, body=body)
-
-        # --- case A) 신규(open, reduceOnly=False)에서 side mismatch ---
-        if (not reduce_only) and ("400172" in msg or "side mismatch" in msg):
-            # 반대 방향 청산 후 다시 신규
-            close_side = "sell" if side.lower() == "buy" else "buy"
-            body_close = _body(close_side, True)
-            log.warning("side mismatch on open -> force close first: %s (size=%s)", close_side, size)
-            try:
-                self._request("POST", path, body=body_close)
-            except Exception as ce:
-                log.warning("force close failed (will still try open): %s", ce)
-            return self._request("POST", path, body=_body(side.lower(), False))
-
-        # --- case B) 청산(reduceOnly=True)에서 side mismatch ---
-        if reduce_only and ("400172" in msg or "side mismatch" in msg):
-            # 청산 대상이 없다고 판단 → 같은 방향 신규 진입으로 전환
-            log.warning("side mismatch on reduceOnly -> fallback to OPEN(side=%s, size=%s)", side, size)
-            return self._request("POST", path, body=_body(side.lower(), False))
-
-        # 그 밖의 에러는 그대로 re-raise
-        raise
-
+        # 1차 시도
+        body_open = self._body(symbol, side_norm, order_type, size, reduce_only, client_oid)
+        try:
+            return self._request("POST", path, body=body_open)
+        except requests.HTTPError as e:
+            # Bitget 응답 본문에서 코드/메시지 뽑기
+            msg = str(e)
+            if ("400172" in msg) or ("side mismatch" in msg):
+                if not reduce_only:
+                    # 신규인데 방향이 안 맞으면 -> 반대방향 강제청산 후 다시 신규
+                    close_side = "sell" if side_norm == "buy" else "buy"
+                    body_close = self._body(symbol, close_side, order_type, size, True, client_oid)
+                    log.warning("side mismatch on OPEN -> force CLOSE first: %s (size=%s)", close_side, size)
+                    try:
+                        self._request("POST", path, body=body_close)
+                    except Exception as ce:
+                        log.warning("force close failed (continue to OPEN): %s", ce)
+                    return self._request("POST", path, body=self._body(symbol, side_norm, order_type, size, False, client_oid))
+                else:
+                    # 청산인데 포지션이 없으면 -> 같은 방향 신규로 전환
+                    log.warning("side mismatch on CLOSE -> fallback to OPEN(side=%s, size=%s)", side_norm, size)
+                    return self._request("POST", path, body=self._body(symbol, side_norm, order_type, size, False, client_oid))
+            raise
