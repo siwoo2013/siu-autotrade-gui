@@ -183,56 +183,64 @@ class BitgetClient:
     def _opp(side: str) -> str:
         return "sell" if side.lower() == "buy" else "buy"
 
-    def place_order(
-        self,
-        symbol: str,
-        side: str,
-        type: str,
-        size: float,
-        reduce_only: bool = False,
-        client_oid: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        원웨이 모드 기본 주문 + side mismatch(400172) 시 강제청산 후 재시도.
-        """
-        path = "/api/mix/v1/order/placeOrder"
-        order_type = "market" if type.upper() == "MARKET" else "limit"
+def place_order(
+    self,
+    symbol: str,
+    side: str,
+    type: str,
+    size: float,
+    reduce_only: bool = False,
+    client_oid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    원웨이 모드 기본 주문.
+    - 400172(side mismatch) 방어:
+        1) reduceOnly=False(신규)에서 400172 → 반대방향 reduceOnly=True 강제청산 → 다시 신규
+        2) reduceOnly=True(청산)에서 400172 → 청산대상이 없다고 판단하고 같은 방향 신규(reduceOnly=False)로 전환
+    """
+    path = "/api/mix/v1/order/placeOrder"
+    order_type = "market" if type.upper() == "MARKET" else "limit"
 
-        def _body(side_value: str, ro: bool) -> Dict[str, Any]:
-            b: Dict[str, Any] = {
-                "symbol": symbol,
-                "marginCoin": self.margin_coin,
-                "productType": self.product_type,
-                "side": side_value,            # one-way: buy/sell
-                "orderType": order_type,
-                "size": str(size),
-                "reduceOnly": bool(ro),
-            }
-            if client_oid:
-                b["clientOid"] = client_oid
-            return b
+    def _body(side_value: str, ro: bool) -> Dict[str, Any]:
+        b: Dict[str, Any] = {
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
+            "side": side_value,            # one-way: buy/sell
+            "orderType": order_type,
+            "size": str(size),
+            "reduceOnly": bool(ro),
+        }
+        if client_oid:
+            b["clientOid"] = client_oid
+        return b
 
-        body_open = _body(side.lower(), reduce_only)
+    body_open = _body(side.lower(), reduce_only)
 
-        try:
-            return self._request("POST", path, body=body_open)
+    try:
+        return self._request("POST", path, body=body_open)
 
-        except requests.HTTPError as e:
-            msg = str(e).lower()
+    except requests.HTTPError as e:
+        msg = str(e).lower()
 
-            # 400172: side mismatch → 반대방향 reduceOnly 청산 후 재시도
-            if ("400172" in msg) or ("side mismatch" in msg):
-                if not reduce_only:
-                    close_side = self._opp(side)
-                    body_close = _body(close_side, True)
-                    log.warning("side mismatch -> force close first: %s (size=%s)", close_side, size)
-                    try:
-                        self._request("POST", path, body=body_close)
-                    except Exception as ce:
-                        log.warning("force close failed (will still try open): %s", ce)
+        # --- case A) 신규(open, reduceOnly=False)에서 side mismatch ---
+        if (not reduce_only) and ("400172" in msg or "side mismatch" in msg):
+            # 반대 방향 청산 후 다시 신규
+            close_side = "sell" if side.lower() == "buy" else "buy"
+            body_close = _body(close_side, True)
+            log.warning("side mismatch on open -> force close first: %s (size=%s)", close_side, size)
+            try:
+                self._request("POST", path, body=body_close)
+            except Exception as ce:
+                log.warning("force close failed (will still try open): %s", ce)
+            return self._request("POST", path, body=_body(side.lower(), False))
 
-                    # close 이후 다시 원래 주문
-                    return self._request("POST", path, body=body_open)
+        # --- case B) 청산(reduceOnly=True)에서 side mismatch ---
+        if reduce_only and ("400172" in msg or "side mismatch" in msg):
+            # 청산 대상이 없다고 판단 → 같은 방향 신규 진입으로 전환
+            log.warning("side mismatch on reduceOnly -> fallback to OPEN(side=%s, size=%s)", side, size)
+            return self._request("POST", path, body=_body(side.lower(), False))
 
-            # 그 외는 그대로 전달
-            raise
+        # 그 밖의 에러는 그대로 re-raise
+        raise
+
