@@ -1,148 +1,165 @@
+# server.py
+from __future__ import annotations
+
 import os
-import time
-import hmac
-import json
-import hashlib
-import base64
-from enum import Enum
-from typing import Optional, Dict, Any
+import logging
+from pathlib import Path
+from typing import Any, Dict
 
-import requests
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from bitget import BitgetClient
 
-class PositionState(str, Enum):
-    FLAT = "flat"
-    LONG = "long"
-    SHORT = "short"
+# ---------- 설정/모드 ----------
+APP_NAME = "siu-autotrade-gui"
+BASE_DIR = Path(__file__).resolve().parent
 
+TRADE_MODE = os.getenv("TRADE_MODE", "demo").lower()
+if os.getenv("DEMO") is not None:
+    DEMO = os.getenv("DEMO", "false").lower() in ["1", "true", "yes", "on"]
+else:
+    DEMO = (TRADE_MODE != "live")
 
-class BitgetClient:
+MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
+
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+
+# ---------- 로거 ----------
+logger = logging.getLogger(APP_NAME)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+handler.setFormatter(formatter)
+if not logger.handlers:
+    logger.addHandler(handler)
+
+# ---------- Bitget client ----------
+bg_client = BitgetClient(
+    api_key=BITGET_API_KEY,
+    api_secret=BITGET_API_SECRET,
+    passphrase=BITGET_PASSPHRASE,
+    demo=DEMO,
+)
+
+# ---------- 유틸 ----------
+def normalize_symbol(sym: str) -> str:
     """
-    - demo=True  : 실호출 대신 로그만 남기고 성공 시뮬레이션
-    - demo=False : Bitget REST LIVE 호출
+    TradingView : BTCUSDT.P  → Bitget : BTCUSDT_UMCBL
+    이미 *_UMCBL / *_DMCBL 이면 그대로 사용.
     """
-    def __init__(self, api_key: str, api_secret: str, passphrase: str,
-                 base_url: str = "https://api.bitget.com", demo: bool = True):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.passphrase = passphrase
-        self.base_url = base_url.rstrip("/")
-        self.demo = demo
-        self.session = requests.Session()
-        # 기본 마진코인(USDT-M Perp)
-        self.margin_coin = "USDT"
+    s = sym.upper().strip()
+    if s.endswith("_UMCBL") or s.endswith("_DMCBL"):
+        return s
+    if s.endswith(".P"):
+        return s.replace(".P", "_UMCBL")
+    # 기타 케이스도 기본 UMCBL
+    return f"{s}_UMCBL"
 
-    # ===== Helpers ============================================================
-    def _ts(self) -> str:
-        # Bitget는 밀리초 타임스탬프 문자열 요구
-        return str(int(time.time() * 1000))
+# ---------- FastAPI ----------
+app = FastAPI(title=APP_NAME)
 
-    def _sign(self, ts: str, method: str, path: str, body: str) -> str:
-        msg = ts + method.upper() + path + body
-        mac = hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).digest()
-        return base64.b64encode(mac).decode()
+@app.get("/")
+def root():
+    return {"ok": True, "service": APP_NAME, "mode": "live" if not DEMO else "demo"}
 
-    def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        return {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
-            "ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json",
-        }
+@app.post("/tv")
+async def tv_webhook(req: Request):
+    """
+    TradingView → (json) → /tv
+      {
+        "secret": "...",
+        "route": "order.reverse",
+        "exchange": "bitget",
+        "symbol": "BTCUSDT.P",
+        "target_side": "BUY" | "SELL",
+        "type": "MARKET",
+        "size": 0.001,
+        "client_oid": "optional"
+      }
+    """
+    raw = await req.body()
+    try:
+        data = await req.json()
+    except Exception:
+        logger.error(f"{MODE_TAG} [TV] Invalid JSON RAW: {raw!r}")
+        return JSONResponse({"ok": False, "reason": "invalid-json"}, status_code=400)
 
-    def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        url = self.base_url + path
-        payload = json.dumps(body or {}, separators=(",", ":"))
-        ts = self._ts()
-        sign = self._sign(ts, method, path, payload if method != "GET" else "")
-        headers = self._headers(ts, sign)
-        if method == "GET":
-            resp = self.session.get(url, headers=headers, params=body or {}, timeout=10)
-        else:
-            resp = self.session.request(method, url, headers=headers, data=payload, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") not in ("00000", 0, "0", None):
-            raise RuntimeError(f"Bitget error: {data}")
-        return data
+    # 0) secret 체크
+    if data.get("secret") != WEBHOOK_SECRET:
+        logger.warning(f"{MODE_TAG} [TV] invalid secret")
+        return JSONResponse({"ok": False, "reason": "invalid-secret"}, status_code=403)
 
-    def _log(self, msg: str):
-        tag = "[DEMO]" if self.demo else "[LIVE]"
-        print(f"{tag} {msg}", flush=True)
+    route = str(data.get("route", ""))
+    exchange = str(data.get("exchange", "bitget")).lower()
+    symbol_in = str(data.get("symbol", ""))
+    side = str(data.get("target_side", "")).upper()
+    typ = str(data.get("type", "MARKET")).upper()
+    size = float(data.get("size", 0))
+    client_oid = data.get("client_oid")
 
-    # ===== Public =============================================================
-    def get_net_position(self, symbol: str) -> PositionState:
-        """
-        LIVE: 단일 심볼 포지션 조회
-        DEMO: 항상 FLAT로 시작, 내부 상태 없이 '거래 기록'에 의존하지 않고 서버 로직에서 reverse/skip 판단 가능.
-        """
-        if self.demo:
-            # 데모에서는 서버 로직에서 same-direction-skip / reverse 등 판단 로그만 찍고
-            # 체결 영향은 없으니, 여기서는 거래소 조회 생략
-            return PositionState.FLAT
+    if exchange != "bitget":
+        return JSONResponse({"ok": False, "reason": "unsupported-exchange"}, status_code=400)
+    if typ != "MARKET":
+        return JSONResponse({"ok": False, "reason": "only-market-supported"}, status_code=400)
+    if side not in ("BUY", "SELL"):
+        return JSONResponse({"ok": False, "reason": "invalid-side"}, status_code=400)
+    if size <= 0:
+        return JSONResponse({"ok": False, "reason": "invalid-size"}, status_code=400)
 
-        # Bitget 단일 포지션 조회 (USDT-M)
-        path = "/api/mix/v1/position/singlePosition"
-        params = {"symbol": symbol, "marginCoin": self.margin_coin}
-        data = self._request("GET", path, params)
+    symbol = normalize_symbol(symbol_in)
 
-        pos_data = (data.get("data") or {})
-        if not pos_data:
-            return PositionState.FLAT
+    logger.info(f"{MODE_TAG} [TV] 수신 | {symbol} | {route} | {side} | size={size}")
 
-        holdSide = (pos_data.get("holdSide") or "").lower()  # long|short|none
-        if holdSide == "long":
-            return PositionState.LONG
-        if holdSide == "short":
-            return PositionState.SHORT
-        return PositionState.FLAT
+    # 1) 포지션 조회 (★로깅 강화)
+    try:
+        pos = bg_client.get_net_position(symbol)
+        net = float(pos.get("net", 0.0))
+        logger.info(f"{MODE_TAG} 현재 순포지션 | {symbol} | net={net}")
+    except Exception as e:
+        # Bitget 에러 본문까지 찍히게 bitget.py에서 던지도록 변경되어 있음
+        logger.exception(f"{MODE_TAG} [TV] 포지션 조회 실패 | {symbol} | err={e}")
+        return JSONResponse({"ok": False, "reason": f"position-fetch-failed: {e}"}, status_code=500)
 
-    def place_market_order(self, symbol: str, side: str, size: float,
-                           reduce_only: bool = False, client_oid: Optional[str] = None) -> str:
-        """
-        LIVE: 시장가 주문
-        DEMO: 로깅만
-        """
-        side = side.upper()  # BUY|SELL
+    # 2) 리버스 로직
+    if route == "order.reverse":
+        # (a) 같은 방향이면 무시
+        if (net > 0 and side == "BUY") or (net < 0 and side == "SELL"):
+            logger.info(f"{MODE_TAG} state=same-direction-skip | net={net} | side={side}")
+            return {"ok": True, "state": "same-direction-skip"}
 
-        if self.demo:
-            self._log(f"place_order {symbol} {side} MARKET size={size} reduce_only={reduce_only} -> net=~0.0")
-            return f"tv-{int(time.time()*1000)}-open"
+        # (b) 반대/플랫 → 먼저 청산, 그다음 신규 진입
+        try:
+            if abs(net) > 0:
+                # 현재 보유 수량을 reduce_only로 청산
+                close_side = "BUY" if net < 0 else "SELL"  # 숏보유면 BUY로 close_short, 롱보유면 SELL로 close_long
+                logger.info(f"{MODE_TAG} close_position {symbol} {close_side} reduce_only size={abs(net)}")
+                bg_client.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    size=abs(net),
+                    order_type="MARKET",
+                    reduce_only=True,
+                    client_oid=(f"tv-close-{client_oid}" if client_oid else None),
+                )
 
-        path = "/api/mix/v1/order/placeOrder"
-        body = {
-            "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            "size": str(size),
-            "side": "open_long" if side == "BUY" else "open_short",
-            "orderType": "market",
-            "reduceOnly": reduce_only,
-        }
-        if client_oid:
-            body["clientOid"] = client_oid
+            # 신규 진입
+            logger.info(f"{MODE_TAG} place_order {symbol} {side} MARKET size={size}")
+            bg_client.place_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                order_type="MARKET",
+                reduce_only=False,
+                client_oid=client_oid,
+            )
+            return {"ok": True, "state": "reverse"}
+        except Exception as e:
+            logger.exception(f"{MODE_TAG} [TV] 주문 오류 | {symbol} | err={e}")
+            return JSONResponse({"ok": False, "reason": f"order-failed: {e}"}, status_code=500)
 
-        data = self._request("POST", path, body)
-        oid = (data.get("data") or {}).get("orderId") or f"tv-{int(time.time()*1000)}-open"
-        self._log(f"place_order {symbol} {side} MARKET size={size} reduce_only={reduce_only} -> oid={oid}")
-        return oid
-
-    def close_position(self, symbol: str, side: str, client_oid: Optional[str] = None) -> None:
-        """
-        LIVE: 전량 청산 (side 기준은 '무엇으로 청산하나' BUY/SELL)
-        DEMO: 로깅만
-        """
-        side = side.upper()
-
-        if self.demo:
-            self._log(f"close_position {symbol} side={side} size=ALL -> net=0.0")
-            return
-
-        path = "/api/mix/v1/order/closeAllPositions"
-        # Bitget은 심볼/마진코인만 주면 전량 청산 가능(포지션 방향은 거래소가 판단)
-        body = {
-            "symbol": symbol,
-            "marginCoin": self.margin_coin,
-        }
-        data = self._request("POST", path, body)
-        self._log(f"close_position {symbol} side={side} size=ALL -> done")
+    # 기타 라우트는 아직 미지원
+    return JSONResponse({"ok": False, "reason": "unsupported-route"}, status_code=400)
