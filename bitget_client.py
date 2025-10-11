@@ -254,3 +254,55 @@ class BitgetClient:
 
         data = self._request("POST", path, body=body)
         return data
+
+    # --- [ADD] 서버에서 호출하는 시그니처 그대로 받는 래퍼 -----------------
+    def place_order(
+        self,
+        symbol: str,
+        side: str,             # "BUY" | "SELL"
+        type: str,             # "MARKET" 등 - 여기서는 MARKET만 사용
+        size: float,
+        reduce_only: bool = False,
+        client_oid: str | None = None,
+    ) -> dict:
+        """
+        server.py가 기대하는 시그니처. type은 현재 MARKET만 지원.
+        내부적으로 place_order_market을 호출한다.
+        """
+        # type은 현재 무시 (MARKET만 처리)
+        return self.place_order_market(
+            symbol=symbol,
+            side=side,
+            size=size,
+            reduce_only=reduce_only,
+            client_oid=client_oid,
+        )
+
+    # --- [ADD/KEEP] 실제 발주 로직 (마켓 주문) ------------------------------
+    def place_order_market(
+        self,
+        symbol: str,
+        side: str,             # "BUY" | "SELL"
+        size: float,
+        reduce_only: bool = False,
+        client_oid: str | None = None,
+    ) -> dict:
+        """
+        Bitget USDT-M 선물 마켓주문 실행
+        """
+        path = "/api/mix/v1/order/placeOrder"
+        body = {
+            "symbol": symbol,
+            "productType": self.product_type,   # "umcbl"
+            "marginCoin": self.margin_coin,     # "USDT"
+            "size": str(size),
+            "side": side.lower(),               # buy / sell
+            "orderType": "market",              # 마켓 주문
+            "timeInForceValue": "normal",
+        }
+        if reduce_only:
+            body["reduceOnly"] = True
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        return self._request("POST", path, body=body)
