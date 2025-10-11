@@ -1,3 +1,4 @@
+# server.py
 import os
 import re
 from pathlib import Path
@@ -12,11 +13,24 @@ APP_NAME = "siu-autotrade-gui"
 BASE_DIR = Path(__file__).resolve().parent
 
 # ===== Env & mode ============================================================
-DEMO = (os.getenv("DEMO", "true").lower() in ["1", "true", "yes", "on"]) or (
-    os.getenv("TRADE_MODE", "demo").lower() != "live"
-)
-MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
+from pathlib import Path
+import os
 
+APP_NAME = "siu-autotrade-gui"
+BASE_DIR = Path(__file__).resolve().parent
+
+# 1) TRADE_MODE가 우선권 (live | demo)
+TRADE_MODE = os.getenv("TRADE_MODE", "demo").lower()  # 기본 demo
+
+# 2) DEMO 환경변수가 명시되면 그 값으로 덮어쓰기 (호환 목적)
+#    - true/1/on/yes => 데모 모드
+#    - false/0/off/no => 라이브 모드
+if os.getenv("DEMO") is not None:
+    DEMO = os.getenv("DEMO", "false").lower() in ["1", "true", "yes", "on"]
+else:
+    DEMO = (TRADE_MODE != "live")
+
+MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
 
 # ===== FastAPI ===============================================================
@@ -45,14 +59,24 @@ def head_favicon():
     return Response(status_code=204)
 
 # ===== Helpers ===============================================================
+# TV 예: BINANCE:BTCUSDT.P, BYBIT:ETHUSDT.P 등
 TV_TICKER_RE = re.compile(r"^[A-Z0-9]+:([A-Z0-9]+)(?:\.[A-Z0-9]+)?$")
 
 def normalize_symbol(tv_symbol: str) -> str:
-    """
-    TV: 'BINANCE:BTCUSDT.P' -> 'BTCUSDT'
-    """
+    """TV 심볼에서 거래소 접두사/접미사를 제거: BINANCE:BTCUSDT.P -> BTCUSDT"""
     m = TV_TICKER_RE.match(tv_symbol)
     return m.group(1) if m else tv_symbol
+
+def normalize_symbol_for_bitget(tv_symbol: str) -> str:
+    """
+    Bitget USDT-M Perp 심볼로 변환.
+    TV: BINANCE:BTCUSDT.P -> BTCUSDT -> BTCUSDT_UMCBL
+    (이미 _UMCBL 이 붙어있으면 그대로 둠)
+    """
+    base = normalize_symbol(tv_symbol)
+    if not base.endswith("_UMCBL"):
+        base = f"{base}_UMCBL"
+    return base
 
 def log(msg: str):
     print(f"{MODE_TAG} {msg}", flush=True)
@@ -86,24 +110,34 @@ def root():
 # ===== TradingView Webhook ====================================================
 @app.post("/tv")
 async def tv_webhook(request: Request):
-    # 1) Parse JSON
+    # 1) Parse JSON (원본이 JSON 한 줄이어야 함)
     try:
         body = await request.json()
     except Exception:
+        # 디버깅용 원문을 남겨 원인 파악 쉽게
+        raw = await request.body()
+        log(f"[tv] Invalid JSON RAW: {raw.decode(errors='ignore')[:300]}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # 2) 모델 검증
     try:
         data = TvWebhook(**body)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    # 2) Secret check
+    # 3) Secret 검증
     if WEBHOOK_SECRET and (data.secret or "") != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Bad secret")
 
-    # 3) Normalize inputs
+    # 4) 입력 정규화
     tv_symbol = data.symbol
-    symbol = normalize_symbol(tv_symbol)
+    ex = (data.exchange or "").lower().strip()
+    # ★ Bitget이면 자동으로 UMCBL 심볼 붙이기
+    if ex == "bitget":
+        symbol = normalize_symbol_for_bitget(tv_symbol)
+    else:
+        symbol = normalize_symbol(tv_symbol)
+
     route = data.route.lower().strip()
     order_type = (data.type or "MARKET").upper()
     size = float(data.size) if data.size is not None else None
@@ -112,7 +146,7 @@ async def tv_webhook(request: Request):
 
     log(f"[TV] 수신 | {symbol} | {route} | {target_side or data.side} | size={size}")
 
-    # 4) Routing
+    # 5) 라우팅
     if route == "order.reverse":
         if order_type != "MARKET":
             raise HTTPException(status_code=400, detail="Only MARKET supported")
@@ -130,10 +164,9 @@ async def tv_webhook(request: Request):
             log(f"[TV] 처리완료 | {symbol} | reverse | state=same-direction-skip")
             return JSONResponse({"ok": True, "state": "same-direction-skip"})
 
-        # 반대 포지션 리버스
+        # 반대 포지션이면 전량 청산
         if (pos == PositionState.LONG and target_side == "SELL") or \
            (pos == PositionState.SHORT and target_side == "BUY"):
-            # 전량 청산
             close_side = "SELL" if pos == PositionState.LONG else "BUY"
             bg_client.close_position(symbol, close_side, client_oid=client_oid)
 
@@ -144,7 +177,7 @@ async def tv_webhook(request: Request):
         return JSONResponse({"ok": True, "state": state, "order_id": oid})
 
     elif route == "order.close":
-        # 전량 청산
+        # 전량 청산 (side=BUY/SELL 로 전달)
         side = (data.side or "").upper()
         if side not in ["BUY", "SELL"]:
             raise HTTPException(status_code=400, detail="side must be BUY or SELL")
