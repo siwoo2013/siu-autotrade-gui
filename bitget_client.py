@@ -54,19 +54,30 @@ class BitgetClient:
     # 시간 동기화 및 타임스탬프
     # --------------------------------------------------------------------- #
     def _server_time(self) -> int:
-        """Bitget 서버 시간(ms) 조회"""
-        # mix endpoint (futures)
-        url = f"{self.base_url}/api/mix/v1/public/time"
-        r = self.session.get(url, timeout=self.timeout)
+        """
+        Bitget 서버 시간(ms) 조회.
+        Mix 공개 시세 엔드포인트의 requestTime을 사용 (항상 ms epoch).
+        """
+        url = f"{self.base_url}/api/mix/v1/market/ticker"
+        params = {"symbol": "BTCUSDT_UMCBL"}  # 아무 액티브한 심볼이면 OK
+        r = self.session.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
-        # {"code":"00000","msg":"success","requestTime":..., "data": {"serverTime": 170...}}
-        if isinstance(data, dict):
-            if "data" in data and isinstance(data["data"], dict) and "serverTime" in data["data"]:
-                return int(data["data"]["serverTime"])
-            if "requestTime" in data:  # 일부 응답은 requestTime만 줌
-                return int(data["requestTime"])
-        raise RuntimeError(f"Unexpected time response: {data}")
+        # 예: {"code":"00000","msg":"success","requestTime":1760155297530,"data":{...}}
+        if isinstance(data, dict) and "requestTime" in data:
+            return int(data["requestTime"])
+
+        # 혹시 requestTime이 없다면 헤더 Date를 fallback으로 사용
+        # (아래는 거의 안 타지만 안전빵)
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(r.headers.get("Date"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+
+        raise RuntimeError(f"Unexpected ticker response for time sync: {data}")
+   
 
     def _sync_time(self) -> None:
         """서버 시간과의 오프셋(ms) 계산"""
