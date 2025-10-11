@@ -193,7 +193,7 @@ async def tv_webhook(req: Request):
         )
 
         # === 포지션 조회
-        pos = bg_client.get_net_position(symbol)  # 구현: {'net': float} (롱:+, 숏:-, 0:무포)
+        pos = bg_client.get_net_position(symbol)  # {'net': float} (롱:+, 숏:-, 0:무포)
         net = float(pos.get("net", 0.0))
 
         # === 로직: reverse
@@ -211,14 +211,12 @@ async def tv_webhook(req: Request):
                 state = "state=same-direction-skip"
             else:
                 # 반대 방향 → 전량 청산 후 신규
-                # (선물: reduce_only True 로 사이즈는 큰 의미 없음, ALL 청산 메서드가 있으면 그것 사용)
                 try:
                     # 우선 전량 청산
                     bg_client.close_position(symbol, side="ALL")
                 except Exception as e:
-                    # close_position이 없다면 reduce_only 주문으로 청산 시도
+                    # close_position 실패하면 reduce_only 로 청산 시도
                     log.warning("%s close_position 실패, reduce_only로 청산 시도: %s", MODE_TAG, e)
-                    # 반대 방향으로 reduce_only 주문 (시장가)
                     anti = "SELL" if net > 0 else "BUY"
                     bg_client.place_order(symbol, side=anti, type="MARKET", size=abs(net), reduce_only=True)
                 # 신규 진입
