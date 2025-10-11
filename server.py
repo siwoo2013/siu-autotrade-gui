@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # Bitget 클라이언트 모듈 (프로젝트 내 파일)
-from bitget import BitgetClient
+from bitget_client import BitgetClient
 
 
 # ===== 기본 설정 =============================================================
