@@ -1,6 +1,4 @@
-# bitget_client.py
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import base64
@@ -10,19 +8,22 @@ import json
 import logging
 import time
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode
 
 import requests
 
-logger = logging.getLogger("bitget")
-logger.setLevel(logging.INFO)
+log = logging.getLogger("bitget")
+if not log.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
 
 
 class BitgetClient:
     """
-    Bitget REST API (Futures/Mix) - 최소 구현 클라이언트
-    - 서버 시간 동기화(초기 1회 + 40008 에러시 1회 재동기화 후 재시도)
-    - productType=umcbl 명시
+    Bitget U-M (USDT-Margined) 선물 전용 클라이언트.
+    - product_type: 'umcbl' 고정 (BTCUSDT_UMCBL 같은 심볼과 매칭)
+    - marginCoin: 'USDT' 고정
     """
 
     def __init__(
@@ -30,87 +31,83 @@ class BitgetClient:
         api_key: str,
         api_secret: str,
         passphrase: str,
-        demo: bool = False,
+        demo: bool = True,
         timeout: int = 10,
     ) -> None:
-        self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8")
-        self.passphrase = passphrase
-        self.base_url = "https://api.bitget.com"
+        self.api_key = api_key or ""
+        self.api_secret = api_secret or ""
+        self.passphrase = passphrase or ""
         self.timeout = timeout
+        self.demo = demo
 
+        # 고정 파라미터
+        self.product_type = "umcbl"  # ← 오류 로그에 나오던 필드
+        self.margin_coin = "USDT"
+
+        # 공용 세션
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        # Bitget 서버 시간 오프셋(ms), serverTime - localTime
-        self._time_delta_ms: int = 0
+        self.base_url = "https://api.bitget.com"
 
-        # 최초 1회 서버 시간 동기화
+        # 서버 시간 보정(밀리초). 초기에 동기화 시도하되 실패해도 동작은 계속.
+        self._delta_ms = 0
         try:
             self._sync_time()
         except Exception as e:
-            logger.warning("Bitget time sync failed (will retry on demand): %s", e)
+            log.warning("Bitget time sync failed (will retry on demand): %s", e)
 
     # --------------------------------------------------------------------- #
-    # 시간 동기화 및 타임스탬프
+    # 시간 동기화
     # --------------------------------------------------------------------- #
-    def _server_time(self) -> int:
+    def _server_ts_ms(self) -> int:
         """
-        Bitget 서버 시간(ms) 조회.
-        Mix 공개 시세 엔드포인트의 requestTime을 사용 (항상 ms epoch).
+        Bitget 서버 시간(ms). v2 공개 엔드포인트 사용.
         """
-        url = f"{self.base_url}/api/mix/v1/market/ticker"
-        params = {"symbol": "BTCUSDT_UMCBL"}  # 아무 액티브한 심볼이면 OK
-        r = self.session.get(url, params=params, timeout=self.timeout)
+        url = f"{self.base_url}/api/v2/public/time"
+        r = self.session.get(url, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
-        # 예: {"code":"00000","msg":"success","requestTime":1760155297530,"data":{...}}
-        if isinstance(data, dict) and "requestTime" in data:
-            return int(data["requestTime"])
-
-        # 혹시 requestTime이 없다면 헤더 Date를 fallback으로 사용
-        # (아래는 거의 안 타지만 안전빵)
-        try:
-            from email.utils import parsedate_to_datetime
-            dt = parsedate_to_datetime(r.headers.get("Date"))
-            return int(dt.timestamp() * 1000)
-        except Exception:
-            pass
-
-        raise RuntimeError(f"Unexpected ticker response for time sync: {data}")
-   
+        # {'code':'00000','msg':'success','requestTime':..., 'data':{'time': 171xxx}}
+        return int(data.get("data", {}).get("time"))
 
     def _sync_time(self) -> None:
-        """서버 시간과의 오프셋(ms) 계산"""
-        local_before = int(time.time() * 1000)
-        server = self._server_time()
-        local_after = int(time.time() * 1000)
-        # 왕복 지연의 절반 보정(대략)
-        local_avg = (local_before + local_after) // 2
-        self._time_delta_ms = server - local_avg
-        logger.info("Bitget time synced. delta_ms=%d", self._time_delta_ms)
+        local_ms_1 = int(time.time() * 1000)
+        server_ms = self._server_ts_ms()
+        local_ms_2 = int(time.time() * 1000)
+        rtt = (local_ms_2 - local_ms_1) // 2
+        self._delta_ms = server_ms - (local_ms_1 + rtt)
+        log.info("Bitget time synced. delta_ms=%s", self._delta_ms)
 
-    def _timestamp_ms(self) -> int:
-        """동기화된 타임스탬프(ms) 반환"""
-        return int(time.time() * 1000 + self._time_delta_ms)
+    def _now_ms(self) -> int:
+        """
+        서버 시간 보정값을 반영한 현재시각(ms).
+        """
+        return int(time.time() * 1000) + self._delta_ms
 
     # --------------------------------------------------------------------- #
-    # 서명 & 요청
+    # 서명/요청
     # --------------------------------------------------------------------- #
-    def _sign(self, ts: str, method: str, path: str, query: str, body: str) -> str:
-        # Bitget prehash: timestamp + method + requestPath + (queryString) + (body)
-        # query/ body가 빈 문자열이면 생략된 상태로 이어붙임
-        prehash = f"{ts}{method.upper()}{path}{query}{body}"
-        digest = hmac.new(self.api_secret, prehash.encode("utf-8"), hashlib.sha256).digest()
-        return base64.b64encode(digest).decode()
+    def _sign(self, ts_ms: int, method: str, path_qs: str, body: str = "") -> str:
+        """
+        Bitget 시그니처:  sign = base64( HMAC_SHA256(secret, f"{ts}{method}{path}{body}") )
+        * ts는 문자열 (밀리초)
+        * path는 '/api/...' + 쿼리스트링 포함
+        """
+        msg = f"{ts_ms}{method.upper()}{path_qs}{body}"
+        mac = hmac.new(
+            self.api_secret.encode("utf-8"),
+            msg=msg.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).digest()
+        return base64.b64encode(mac).decode()
 
-    def _headers(self, ts: str, sign: str) -> Dict[str, str]:
+    def _headers(self, ts_ms: int, sign: str) -> Dict[str, str]:
         return {
             "ACCESS-KEY": self.api_key,
             "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-TIMESTAMP": str(ts_ms),
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
-            "locale": "en-US",
+            "X-CHANNEL-API-CODE": "bitget",  # 없어도 무방
         }
 
     def _request(
@@ -119,189 +116,146 @@ class BitgetClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
-        *,
-        _retry_on_time_error: bool = True,
+        auth: bool = True,
     ) -> Dict[str, Any]:
         """
-        Bitget 요청 래퍼
-        - 40008(Request timestamp expired) 발생 시 1회 시간 재동기화 후 재시도
+        Bitget REST 요청 래퍼.
+        - 실패 시 상세 본문 로깅
         """
-        params = params or {}
-        body = body or {}
+        url = f"{self.base_url}{path}"
+        qs = ""
+        if params:
+            # params 순서는 서명에 영향 → requests가 처리하는 쿼리 문자열보다
+            # 서명 생성 시에는 path에 미리 붙이는 방식이 안전
+            from urllib.parse import urlencode
 
-        # query string, body 문자열화
-        query = f"?{urlencode(params)}" if params else ""
-        body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
+            qs = "?" + urlencode(params, doseq=False, safe=",:")
+            url = f"{url}{qs}"
 
-        ts = str(self._timestamp_ms())
-        sign = self._sign(ts, method, path, query, body_str)
-        url = f"{self.base_url}{path}{query}"
-        headers = self._headers(ts, sign)
+        body_str = json.dumps(body) if body else ""
+        headers = {}
+
+        if auth:
+            ts = self._now_ms()
+            # 간헐적 timestamp 오류(40008) 재시도: 시간 재동기화 후 1회 더 시도
+            def sign_headers(ts_ms: int) -> Dict[str, str]:
+                sign = self._sign(ts_ms, method, f"{path}{qs}", body_str)
+                return self._headers(ts_ms, sign)
+
+            headers = sign_headers(ts)
+        else:
+            headers = {"Content-Type": "application/json"}
 
         try:
             if method.upper() == "GET":
                 resp = self.session.get(url, headers=headers, timeout=self.timeout)
-            elif method.upper() == "POST":
-                resp = self.session.post(url, headers=headers, data=body_str, timeout=self.timeout)
             else:
-                raise ValueError(f"Unsupported method: {method}")
+                resp = self.session.post(url, headers=headers, data=body_str, timeout=self.timeout)
 
-            # 4xx/5xx면 raise -> 아래 except에서 Bitget 본문 로깅
-            resp.raise_for_status()
-            data = resp.json()
-            return data
-        except requests.HTTPError as e:
-            detail: Any = None
             try:
-                detail = resp.json()  # type: ignore[name-defined]
-            except Exception:
-                detail = resp.text if "resp" in locals() else None
-
-            logger.error(
-                "Bitget HTTP %s %s -> %s | url=%s%s | body=%s",
-                method.upper(),
-                path,
-                getattr(resp, "status_code", "NA"),
-                self.base_url,
-                path + query,
-                body_str,
-            )
-            logger.error("Bitget response: %s", detail)
-
-            # 타임스탬프 만료(40008)면 1회 동기화 후 재시도
-            code = None
-            if isinstance(detail, dict):
-                code = detail.get("code")
-            if _retry_on_time_error and code == "40008":
+                resp.raise_for_status()
+            except requests.HTTPError as e:
+                # 세부 본문 로깅
+                detail = {}
                 try:
-                    self._sync_time()
-                except Exception as se:
-                    logger.warning("Time resync failed: %s", se)
-                return self._request(method, path, params, body, _retry_on_time_error=False)
+                    detail = resp.json()
+                except Exception:
+                    pass
+                log.error("Bitget HTTP %s %s -> %s | url=%s | body=%s",
+                          method.upper(), path, resp.status_code, url, body_str)
+                if detail:
+                    log.error("Bitget response: %s", detail)
 
-            raise requests.HTTPError(
-                f"{e} | url={getattr(resp,'url','')} | body={body_str} | detail={detail}"
-            ) from e
+                # 타임스탬프 만료면 한 번만 다시 동기화 후 재시도
+                if isinstance(detail, dict) and detail.get("code") == "40008":
+                    try:
+                        self._sync_time()
+                        ts2 = self._now_ms()
+                        hdr2 = self._headers(ts2, self._sign(ts2, method, f"{path}{qs}", body_str))
+                        if method.upper() == "GET":
+                            resp2 = self.session.get(url, headers=hdr2, timeout=self.timeout)
+                        else:
+                            resp2 = self.session.post(url, headers=hdr2, data=body_str, timeout=self.timeout)
+                        resp2.raise_for_status()
+                        return resp2.json()
+                    except Exception:
+                        pass
+
+                raise requests.HTTPError(
+                    f"{e} | url={resp.url} | body={body_str} | detail={detail}"
+                ) from e
+
+            return resp.json()
+
+        except requests.RequestException:
+            raise  # 상위에서 처리/로그
 
     # --------------------------------------------------------------------- #
-    # 심볼/포지션/주문
+    # 공개/계정/거래
     # --------------------------------------------------------------------- #
-    @staticmethod
-    def normalize_symbol(symbol: str) -> str:
-        """TV/거래소 심볼 표기 통일"""
-        s = symbol.strip().upper()
-        if s.endswith(".P"):
-            # TradingView: BTCUSDT.P  ->  Bitget: BTCUSDT_UMCBL
-            return s.replace(".P", "_UMCBL")
-        if s.endswith("_P"):
-            return s.replace("_P", "_UMCBL")
-        if not s.endswith("_UMCBL"):
-            # 안전장치: USDT 선물 기본
-            if s.endswith("USDT"):
-                s = f"{s}_UMCBL"
-        return s
-
-    def get_net_position(self, symbol: str) -> Dict[str, float]:
+    def get_net_position(self, symbol: str) -> Dict[str, Any]:
         """
-        순포지션 조회: {'net': float}
-        (롱:+, 숏:-, 무포:0)
+        단일 심볼의 순포지션 수량 조회.
+        Bitget: GET /api/mix/v1/position/singlePosition
         """
-        sym = self.normalize_symbol(symbol)
         path = "/api/mix/v1/position/singlePosition"
         params = {
-            "symbol": sym,
-            "marginCoin": "USDT",
-            "productType": "umcbl",
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
         }
         data = self._request("GET", path, params=params)
-        # 응답 구조 예: {"code":"00000","msg":"success","data":{"holdSide":"long","...","total":0.01}}
-        net = 0.0
-        try:
-            d = data.get("data") or {}
-            # longQty/shortQty 기준 구현이면 여기서 맞춰서 계산
-            long_qty = float(d.get("long", 0) or 0) if isinstance(d, dict) else 0.0
-            short_qty = float(d.get("short", 0) or 0) if isinstance(d, dict) else 0.0
-            # Bitget 문서에 따라 필드가 다를 수 있으므로 보수적 처리
-            # 없으면 holdVol/holdSide 등으로 로직 보강 필요
-        except Exception:
-            # 데이터 구조가 다를 경우 0 처리 (주문 로직은 order.reverse에서 알아서 대응)
-            long_qty = 0.0
-            short_qty = 0.0
-        net = long_qty - short_qty
-        return {"net": net}
+        # data 예시: {'code':'00000','msg':'success','data':{'holdSide':'long','total': 0.01, ...}}
+        info = data.get("data") or {}
+        long_avail = float(info.get("longHoldAvail", 0) or info.get("long", 0) or 0)
+        short_avail = float(info.get("shortHoldAvail", 0) or info.get("short", 0) or 0)
+        # 순포지션 (롱: +, 숏: -) — 없으면 0
+        net = long_avail - short_avail
+        return {"net": net, "raw": info}
 
-    def place_market_order(
-        self, symbol: str, side: str, size: float, client_oid: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def close_position(self, symbol: str, side: str = "ALL") -> Dict[str, Any]:
         """
-        마켓 주문
-        side: "BUY" | "SELL"
+        전량 청산(가능하면 거래소의 close-position 엔드포인트 사용).
+        Bitget: POST /api/mix/v1/position/close-position
+        - side: 'long' | 'short' | 'ALL'
         """
-        sym = self.normalize_symbol(symbol)
-        path = "/api/mix/v1/order/placeOrder"
-
+        path = "/api/mix/v1/position/close-position"
         body = {
-            "symbol": sym,
-            "marginCoin": "USDT",
-            "productType": "umcbl",
-            "size": f"{size}",
-            "side": side.upper(),  # "buy"|"sell" 도 가능
-            "orderType": "market",
-            "timeInForceValue": "normal",
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
         }
-        if client_oid:
-            body["clientOid"] = client_oid
+        if side.upper() in ("LONG", "SHORT"):
+            body["holdSide"] = side.lower()
+        # 'ALL'이면 holdSide 생략 → 전체 청산
+        return self._request("POST", path, body=body)
 
-        data = self._request("POST", path, body=body)
-        return data
-
-    # --- [ADD] 서버에서 호출하는 시그니처 그대로 받는 래퍼 -----------------
     def place_order(
         self,
         symbol: str,
-        side: str,             # "BUY" | "SELL"
-        type: str,             # "MARKET" 등 - 여기서는 MARKET만 사용
+        side: str,
+        type: str,
         size: float,
         reduce_only: bool = False,
-        client_oid: str | None = None,
-    ) -> dict:
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        server.py가 기대하는 시그니처. type은 현재 MARKET만 지원.
-        내부적으로 place_order_market을 호출한다.
-        """
-        # type은 현재 무시 (MARKET만 처리)
-        return self.place_order_market(
-            symbol=symbol,
-            side=side,
-            size=size,
-            reduce_only=reduce_only,
-            client_oid=client_oid,
-        )
-
-    # --- [ADD/KEEP] 실제 발주 로직 (마켓 주문) ------------------------------
-    def place_order_market(
-        self,
-        symbol: str,
-        side: str,             # "BUY" | "SELL"
-        size: float,
-        reduce_only: bool = False,
-        client_oid: str | None = None,
-    ) -> dict:
-        """
-        Bitget USDT-M 선물 마켓주문 실행
+        시장가 주문:
+        Bitget: POST /api/mix/v1/order/placeOrder
         """
         path = "/api/mix/v1/order/placeOrder"
+        # Bitget의 'orderType' 에는 'market' / 'limit' 등. 모두 소문자로.
+        order_type = "market" if type.upper() == "MARKET" else "limit"
+
         body = {
             "symbol": symbol,
-            "productType": self.product_type,   # "umcbl"
-            "marginCoin": self.margin_coin,     # "USDT"
-            "size": str(size),
-            "side": side.lower(),               # buy / sell
-            "orderType": "market",              # 마켓 주문
-            "timeInForceValue": "normal",
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
+            "side": side.lower(),                # buy | sell
+            "orderType": order_type,             # market | limit
+            "size": str(size),                   # 문자열 허용
+            "reduceOnly": bool(reduce_only),
         }
-        if reduce_only:
-            body["reduceOnly"] = True
         if client_oid:
             body["clientOid"] = client_oid
 
