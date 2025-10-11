@@ -183,45 +183,52 @@ class BitgetClient:
     def _opp(side: str) -> str:
         return "sell" if side.lower() == "buy" else "buy"
 
+# --- BitgetClient class 내부에 추가 ---
+
 def place_order(
     self,
     symbol: str,
-    side: str,
-    type: str,
-    size: float,
+    side: str,              # "BUY" | "SELL" (서버에서 대문자로 들어옴)
+    type: str,              # "MARKET" | "LIMIT" (현재는 MARKET만 사용)
+    size,                   # 수량 (문자열/숫자 허용)
     reduce_only: bool = False,
-    client_oid: Optional[str] = None,
-) -> Dict[str, Any]:
+    client_oid: str | None = None,
+):
     """
-    원웨이 모드 기본 주문.
-    - 400172(side mismatch) 방어:
-        1) reduceOnly=False(신규)에서 400172 → 반대방향 reduceOnly=True 강제청산 → 다시 신규
-        2) reduceOnly=True(청산)에서 400172 → 청산대상이 없다고 판단하고 같은 방향 신규(reduceOnly=False)로 전환
-    """
-    path = "/api/mix/v1/order/placeOrder"
-    order_type = "market" if type.upper() == "MARKET" else "limit"
+    One-way 모드 기준:
+      - 오픈:  side = "BUY"  -> 'buy',  reduceOnly=False
+              side = "SELL" -> 'sell', reduceOnly=False
+      - 청산:  side = "BUY"  -> 'buy',  reduceOnly=True  (숏 청산)
+              side = "SELL" -> 'sell', reduceOnly=True  (롱 청산)
 
-    def _body(side_value: str, ro: bool) -> Dict[str, Any]:
-        b: Dict[str, Any] = {
-            "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            "productType": self.product_type,
-            "side": side_value,            # one-way: buy/sell
-            "orderType": order_type,
-            "size": str(size),
-            "reduceOnly": bool(ro),
+    서버(server.py)가 포지션 방향(net) 보고 reduce_only True/False를 결정해 호출합니다.
+    """
+    side_norm = side.strip().lower()
+    if side_norm not in ("buy", "sell"):
+        # 혹시 "open_long/open_short/close_long/close_short"가 들어오면 보정
+        m = {
+            "open_long":  "buy",
+            "open_short": "sell",
+            "close_long": "sell",
+            "close_short":"buy",
         }
-        if client_oid:
-            b["clientOid"] = client_oid
-        return b
+        side_norm = m.get(side_norm, side_norm)
 
-    body_open = _body(side.lower(), reduce_only)
+    order_type = type.strip().lower()  # "market" | "limit" (우린 market)
+    body = {
+        "symbol": symbol,                 # 예: BTCUSDT_UMCBL (서버에서 매핑)
+        "marginCoin": "USDT",
+        "productType": self.product_type, # "umcbl"
+        "side": side_norm,                # "buy" | "sell"
+        "orderType": order_type,          # "market"
+        "size": str(size),
+        "reduceOnly": bool(reduce_only),
+    }
+    if client_oid:
+        body["clientOid"] = client_oid
 
-    try:
-        return self._request("POST", path, body=body_open)
-
-    except requests.HTTPError as e:
-        msg = str(e).lower()
+    path = "/api/mix/v1/order/placeOrder"
+    return self._request("POST", path, body=body)
 
         # --- case A) 신규(open, reduceOnly=False)에서 side mismatch ---
         if (not reduce_only) and ("400172" in msg or "side mismatch" in msg):
