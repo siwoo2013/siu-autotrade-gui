@@ -7,7 +7,7 @@ import hmac
 import json
 import hashlib
 import logging
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -19,9 +19,11 @@ log.setLevel(logging.INFO)
 class BitgetClient:
     """
     Bitget Mix(USDT-M) 선물 전용 경량 클라이언트.
-    - 기본 One-way 모드('buy'/'sell')로 주문.
-    - 만약 계정/심볼이 Hedge라서 400172(side mismatch)가 오면
-      hedge 형식(open_long/close_long/open_short/close_short)으로 즉시 재시도.
+
+    - 기본 One-way 모드('buy'/'sell' + reduceOnly 플래그)로 주문
+    - 400172(side mismatch) 발생 시:
+        * 원웨이 전제에서 반대 방향 + reduceOnly=True 로 강제 청산 실행
+        * 그 후 원래 주문(신규 진입) 재시도
     """
 
     def __init__(
@@ -44,44 +46,31 @@ class BitgetClient:
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
 
-        # 서버 시간과 로컬 시간 drift 보정 (ms)
         self._delta_ms = 0
         try:
             self.sync_time()
         except Exception as e:
             log.warning("Bitget time sync failed (will retry on demand): %s", e)
 
-    # --------------------------------------------------------------------- #
-    # 시간 & 서명
-    # --------------------------------------------------------------------- #
+    # ---- 시간 & 서명 -------------------------------------------------------
     def _ts_ms(self) -> int:
         return int(time.time() * 1000) + self._delta_ms
 
     def sync_time(self) -> None:
-        """
-        Bitget 서버 시간 동기화.
-        /api/v2/public/time 가 표준 공개 엔드포인트.
-        """
         url = f"{self.base_url}/api/v2/public/time"
         r = self.session.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # {"code":"00000","msg":"success","requestTime":...,"data":{"serverTime":...}}
         srv_ms = int(data.get("data", {}).get("serverTime"))
         now_ms = int(time.time() * 1000)
         self._delta_ms = srv_ms - now_ms
         log.info("Bitget time synced. delta_ms=%s", self._delta_ms)
 
     def _sign(self, ts: str, method: str, request_path: str, body: str = "") -> str:
-        """
-        sign = HMAC_SHA256(secret, ts + method + request_path + body) -> base64
-        Bitget v2 사인 타입 '2' 사용.
-        """
         import base64
-
         pre = f"{ts}{method.upper()}{request_path}{body}"
-        h = hmac.new(self.api_secret, pre.encode(), hashlib.sha256).digest()
-        return base64.b64encode(h).decode()
+        sig = hmac.new(self.api_secret, pre.encode(), hashlib.sha256).digest()
+        return base64.b64encode(sig).decode()
 
     def _headers(self, ts: str, sign: str) -> Dict[str, str]:
         return {
@@ -94,9 +83,7 @@ class BitgetClient:
             "X-CHANNEL-API-CODE": "PY",
         }
 
-    # --------------------------------------------------------------------- #
-    # 요청 래퍼
-    # --------------------------------------------------------------------- #
+    # ---- 요청 공통 ---------------------------------------------------------
     def _request(
         self,
         method: str,
@@ -106,29 +93,22 @@ class BitgetClient:
         body: Optional[Dict[str, Any]] = None,
         timeout: int = 15,
     ) -> Dict[str, Any]:
-        """
-        Bitget 호출 공통부. 실패 시 HTTPError 발생.
-        Bitget 에러는 로그에 code/msg와 함께 남긴다.
-        """
         url = f"{self.base_url}{path}"
         params = params or {}
         body = body or {}
+
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
-        # 서명용 path(+query)는 request_path 기준
+
+        # request_path (서명용)
         query = ""
         if params:
-            # Bitget 서명은 request_path?queryString 형태
             from urllib.parse import urlencode
-
             query = "?" + urlencode(params, doseq=True)
 
-        # 시간 스탬프
         ts = str(self._ts_ms())
-
         sign = self._sign(ts, method, f"{path}{query}", body_str)
         headers = self._headers(ts, sign)
 
-        # 전송
         try:
             if method.upper() == "GET":
                 resp = self.session.get(url, headers=headers, params=params, timeout=timeout)
@@ -136,15 +116,13 @@ class BitgetClient:
                 resp = self.session.post(url, headers=headers, params=params, data=body_str, timeout=timeout)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-        except requests.RequestException as e:
-            # 네트워크 오류 등
+        except requests.RequestException:
             raise
 
-        # 2xx 아닌 경우 Bitget 본문을 읽어서 같이 올림
         try:
             resp.raise_for_status()
         except requests.HTTPError as e:
-            detail: Any = {}
+            detail = {}
             try:
                 detail = resp.json()
             except Exception:
@@ -158,22 +136,14 @@ class BitgetClient:
                 f"{e} | url={resp.url} | body={body_str} | detail={detail}"
             ) from e
 
-        # 정상 응답
         data = resp.json()
-        # {"code":"00000","msg":"success", ...}
         if data.get("code") != "00000":
             log.error("Bitget logical error: %s", data)
             raise requests.HTTPError(f"Bitget logical error: {data}")
         return data
 
-    # --------------------------------------------------------------------- #
-    # 정보/포지션
-    # --------------------------------------------------------------------- #
+    # ---- 포지션 ------------------------------------------------------------
     def get_net_position(self, symbol: str) -> Dict[str, float]:
-        """
-        현재 심볼의 순포지션 수량(롱:+, 숏:-)을 대략 계산.
-        Bitget 응답 포맷이 상황에 따라 달라질 수 있어 최대한 안전하게 파싱.
-        """
         path = "/api/mix/v1/position/singlePosition"
         params = {
             "symbol": symbol,
@@ -184,7 +154,6 @@ class BitgetClient:
         d = data.get("data")
         net = 0.0
 
-        # data가 리스트(포지션들)일 수도 있고, 단일 딕셔너리일 수도 있음
         if isinstance(d, list):
             for p in d:
                 try:
@@ -209,9 +178,11 @@ class BitgetClient:
 
         return {"net": net}
 
-    # --------------------------------------------------------------------- #
-    # 주문
-    # --------------------------------------------------------------------- #
+    # ---- 주문 --------------------------------------------------------------
+    @staticmethod
+    def _opp(side: str) -> str:
+        return "sell" if side.lower() == "buy" else "buy"
+
     def place_order(
         self,
         symbol: str,
@@ -222,42 +193,46 @@ class BitgetClient:
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        시장가 주문(표준 one-way → side mismatch면 hedge로 재시도).
+        원웨이 모드 기본 주문 + side mismatch(400172) 시 강제청산 후 재시도.
         """
         path = "/api/mix/v1/order/placeOrder"
         order_type = "market" if type.upper() == "MARKET" else "limit"
 
-        def _body(side_value: str) -> Dict[str, Any]:
+        def _body(side_value: str, ro: bool) -> Dict[str, Any]:
             b: Dict[str, Any] = {
                 "symbol": symbol,
                 "marginCoin": self.margin_coin,
                 "productType": self.product_type,
-                "side": side_value,            # one-way: buy/sell, hedge: open_long/...
+                "side": side_value,            # one-way: buy/sell
                 "orderType": order_type,
                 "size": str(size),
-                "reduceOnly": bool(reduce_only),
+                "reduceOnly": bool(ro),
             }
             if client_oid:
                 b["clientOid"] = client_oid
             return b
 
-        # 1) one-way로 우선 시도 (원웨이 계정이라면 여기서 성공)
-        body1 = _body(side.lower())
+        body_open = _body(side.lower(), reduce_only)
+
         try:
-            return self._request("POST", path, body=body1)
+            return self._request("POST", path, body=body_open)
+
         except requests.HTTPError as e:
-            msg = str(e)
-            # 400172(side mismatch)일 때만 hedge 형식으로 재시도
-            if ("400172" not in msg) and ("side mismatch" not in msg.lower()):
-                raise
+            msg = str(e).lower()
 
-            if reduce_only:
-                mapped = "close_short" if side.lower() == "buy" else "close_long"
-            else:
-                mapped = "open_long" if side.lower() == "buy" else "open_short"
+            # 400172: side mismatch → 반대방향 reduceOnly 청산 후 재시도
+            if ("400172" in msg) or ("side mismatch" in msg):
+                if not reduce_only:
+                    close_side = self._opp(side)
+                    body_close = _body(close_side, True)
+                    log.warning("side mismatch -> force close first: %s (size=%s)", close_side, size)
+                    try:
+                        self._request("POST", path, body=body_close)
+                    except Exception as ce:
+                        log.warning("force close failed (will still try open): %s", ce)
 
-            body2 = _body(mapped)
-            log.warning(
-                "Bitget side mismatch -> retry with hedge side: %s (reduceOnly=%s)", mapped, reduce_only
-            )
-            return self._request("POST", path, body=body2)
+                    # close 이후 다시 원래 주문
+                    return self._request("POST", path, body=body_open)
+
+            # 그 외는 그대로 전달
+            raise
