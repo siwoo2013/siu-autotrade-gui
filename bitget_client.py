@@ -1,164 +1,138 @@
 # bitget_client.py
-from __future__ import annotations
+# -*- coding: utf-8 -*-
 
+from __future__ import annotations
 import time
-import hmac
-import hashlib
 import json
-from typing import Any, Dict
+import hmac
+import base64
+import hashlib
+import logging
+from typing import Any, Dict, Optional
+from urllib.parse import urlencode
+
 import requests
 
-
-API_BASE = "https://api.bitget.com"
+log = logging.getLogger(__name__)
 
 
 class BitgetClient:
-    """
-    Bitget Mix(선물) 간단 클라이언트
-      - 포지션 조회: singlePosition (productType 필수)
-      - 마켓 주문: placeOrder (open/close)
-    """
-
-    def __init__(self, api_key: str, api_secret: str, passphrase: str, demo: bool = False) -> None:
+    def __init__(self, api_key: str, api_secret: str, passphrase: str):
+        self.base = "https://api.bitget.com"
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
         self.session = requests.Session()
-        self.demo = demo  # 로깅용 플래그
 
-    # ---------- 내부 헬퍼 ----------
-
-    def _product_type(self, symbol: str) -> str:
-        """
-        심볼에서 productType 자동 유추.
-        * *_UMCBL -> umcbl
-        * *_DMCBL -> dmcbl
-        * 그 외는 기본 umcbl
-        """
-        s = symbol.upper()
-        if s.endswith("_UMCBL"):
-            return "umcbl"
-        if s.endswith("_DMCBL"):
-            return "dmcbl"
-        return "umcbl"
-
-    def _ts(self) -> str:
-        return str(int(time.time() * 1000))
-
-    def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
-        msg = ts + method + path_with_qs + body
-        return hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
-    def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        return {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
-            "ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json",
-        }
+    # ──────────────────────────────────────────────────────────────────────
+    # Bitget 시그니처: ts + method + requestPath(+query) + body(JSON)
+    # ts : 밀리초 문자열
+    # method : 대문자
+    # requestPath : 예) /api/mix/v1/position/singlePosition?symbol=...&...
+    # body : POST/PUT면 JSON 문자열(없으면 "")
+    # ──────────────────────────────────────────────────────────────────────
+    def _sign(self, ts: str, method: str, request_path_with_query: str, body_str: str = "") -> str:
+        prehash = f"{ts}{method.upper()}{request_path_with_query}{body_str}"
+        digest = hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode()
 
     def _request(
         self,
         method: str,
         path: str,
-        params: Dict[str, Any] | None = None,
-        body: Dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Bitget 요청 공통부. 4xx/5xx 시 응답 본문까지 포함시켜 예외로 던진다.
-        """
-        url = API_BASE + path
-        ts = self._ts()
+        params: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+        timeout: int = 10,
+    ) -> Dict[str, Any]:
+        # 쿼리스트링 구성 (서명과 URL 둘 다 동일하게 사용)
+        query = urlencode(params or {}, doseq=True)
+        request_path = f"{path}?{query}" if query else path
+        url = f"{self.base}{request_path}"
 
-        q = params or {}
-        b = body or {}
+        # 바디 직렬화 (POST/PUT 때만)
+        body_str = json.dumps(body, separators=(",", ":")) if body else ""
 
-        # 고정 정렬 쿼리스트링(서명 일관성)
-        if q:
-            from urllib.parse import urlencode
-            qs = "?" + urlencode(sorted(q.items()))
-        else:
-            qs = ""
+        # 밀리초 타임스탬프
+        ts = str(int(time.time() * 1000))
 
-        body_str = json.dumps(b, separators=(",", ":")) if b else ""
+        # 사인
+        sign = self._sign(ts, method, request_path, body_str)
 
-        sign = self._sign(ts, method, path + qs, body_str)
-        headers = self._headers(ts, sign)
+        headers = {
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-SIGN": sign,
+            # Bitget 최신 스펙에서 사인 타입 2 사용 권장/요구
+            "ACCESS-SIGN-TYPE": "2",
+            "Content-Type": "application/json",
+        }
 
-        if method == "GET":
-            resp = self.session.get(url, headers=headers, params=q, timeout=10)
-        else:
-            resp = self.session.post(url, headers=headers, params=q, data=body_str, timeout=10)
+        resp = self.session.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            data=body_str if body else None,
+            timeout=timeout,
+        )
 
+        # 로깅(디버그)
         if resp.status_code >= 400:
-            # ★ 상태코드 에러 → 본문까지 예외 메시지에 포함
-            raise requests.HTTPError(
-                f"{resp.status_code} {resp.reason} | url={resp.url} | body={resp.text}",
-                response=resp,
+            try:
+                err_json = resp.json()
+            except Exception:
+                err_json = resp.text
+            log.error(
+                "Bitget %s %s => %s | headers=%s | body=%s | resp=%s",
+                method, url, resp.status_code, {k: headers[k] for k in headers if k != "ACCESS-SIGN"},
+                body_str, err_json,
             )
+            resp.raise_for_status()
 
-        data = resp.json()
-        # Bitget은 200이어도 내부 code가 실패일 수 있음
-        if isinstance(data, dict) and data.get("code") not in (None, "00000", "0"):
-            raise requests.HTTPError(
-                f"Bitget error code={data.get('code')} msg={data.get('msg')} | url={resp.url} | body={resp.text}"
-            )
+        return resp.json()
 
-        return data.get("data", data)
-
-    # ---------- 공개 메서드 ----------
-
-    def get_net_position(self, symbol: str, margin_coin: str = "USDT") -> Dict[str, float]:
-        """
-        현재 심볼의 순포지션 수량(net)을 반환.
-        """
-        product_type = self._product_type(symbol)
-
+    # ──────────────────────────────────────────────────────────────────────
+    # 공개/프라이빗 API 래퍼들
+    # ──────────────────────────────────────────────────────────────────────
+    def get_net_position(self, symbol_umcbl: str, margin_coin: str = "USDT") -> Dict[str, Any]:
+        # Bitget 문서 기준 singlePosition 는 productType 필요
         path = "/api/mix/v1/position/singlePosition"
         params = {
-            "symbol": symbol,
+            "symbol": symbol_umcbl,
             "marginCoin": margin_coin,
-            "productType": product_type,   # ★ 필수
+            "productType": "umcbl",
         }
-        data = self._request("GET", path, params=params)
+        return self._request("GET", path, params=params)
 
-        long_total = float(data.get("long", {}).get("total", 0) or 0)
-        short_total = float(data.get("short", {}).get("total", 0) or 0)
-        net = long_total - short_total
-        return {"net": net}
-
-    def place_order(
+    def place_market_order(
         self,
-        symbol: str,
-        side: str,                 # "BUY" | "SELL"
+        symbol_umcbl: str,
+        side: str,           # "buy" or "sell"
         size: float,
-        order_type: str = "MARKET",
-        reduce_only: bool = False,
-        client_oid: str | None = None,
         margin_coin: str = "USDT",
-    ) -> Any:
-        """
-        마켓 주문. (open/close 를 side + reduce_only 로 결정)
-        """
-        product_type = self._product_type(symbol)
-
-        side = side.upper()
-        if reduce_only:
-            api_side = "close_short" if side == "BUY" else "close_long"
-        else:
-            api_side = "open_long" if side == "BUY" else "open_short"
-
+        reduce_only: bool = False,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         path = "/api/mix/v1/order/placeOrder"
         body = {
-            "symbol": symbol,
-            "productType": product_type,
+            "symbol": symbol_umcbl,
             "marginCoin": margin_coin,
             "size": str(size),
-            "side": api_side,
-            "orderType": "market" if order_type.upper() == "MARKET" else "limit",
+            "side": side.lower(),       # buy / sell
+            "orderType": "market",
+            "reduceOnly": reduce_only,
+            "clientOid": client_oid or f"tv-{int(time.time()*1000)}",
+            "productType": "umcbl",
         }
-        if client_oid:
-            body["clientOid"] = client_oid
+        return self._request("POST", path, body=body)
 
+    def close_all(self, symbol_umcbl: str, side: str, margin_coin: str = "USDT") -> Dict[str, Any]:
+        # 필요 시 구현 (예: 전체 청산용)
+        path = "/api/mix/v1/position/closePosition"
+        body = {
+            "symbol": symbol_umcbl,
+            "marginCoin": margin_coin,
+            "productType": "umcbl",
+            "holdSide": side.lower(),   # long / short
+        }
         return self._request("POST", path, body=body)
