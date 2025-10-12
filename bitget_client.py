@@ -16,14 +16,9 @@ import requests
 
 class BitgetClient:
     """
-    Minimal Bitget Mix (UMCBL) REST client (sign-type=2).
-
+    Bitget Mix (UMCBL) REST client (sign-type=2), One-way 전용 (side: buy/sell).
     - product_type: "umcbl" (USDT-M perpetual)
     - margin_coin : "USDT"
-    - One-way logic input: side = "buy" | "sell"
-      * If Bitget account is actually HEDGE mode, we auto-map:
-        - reduce_only=False: buy -> open_long,  sell -> open_short
-        - reduce_only=True : buy -> close_short, sell -> close_long
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -60,7 +55,7 @@ class BitgetClient:
 
     def _sign(self, ts: str, method: str, path_with_query: str, body: str) -> str:
         """
-        sign-type=2 signature:
+        sign-type=2:
         base64( HMAC_SHA256(secret, ts + UPPER(method) + path_with_query + body) )
         """
         msg = (ts + method.upper() + path_with_query + body).encode("utf-8")
@@ -75,26 +70,27 @@ class BitgetClient:
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Keep the exact same query-string (order & encoding) for both:
-        - signature input (path + '?' + query)
-        - real HTTP request URL
+        쿼리 문자열의 '순서'까지 서명에 포함되므로,
+        서명에 사용한 query 를 실제 요청 URL에도 '그대로' 사용한다.
         """
-        method_u = method.upper()
+        m = method.upper()
         url = self.BASE_URL + path
         ts = self._timestamp_ms()
 
-        # ---- Build deterministic query string (sorted by key) ----
+        # 1) 정렬된 쿼리 문자열 생성 (order 고정)
         query = ""
-        if method_u == "GET" and params:
+        if m == "GET" and params:
             ordered: List[Tuple[str, Any]] = [(k, params[k]) for k in sorted(params.keys())]
             query = "?" + urlencode(ordered)
-            url = url + query  # use the same exact string in the real request URL
+            url = url + query  # 실제 요청 URL에도 동일 문자열 사용
 
+        # 2) body 직렬화
         raw_body = ""
-        if method_u != "GET" and body:
+        if m != "GET" and body:
             raw_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        sign = self._sign(ts, method_u, path + query, raw_body)
+        # 3) 서명
+        sign = self._sign(ts, m, path + query, raw_body)
 
         headers = {
             "ACCESS-KEY": self.api_key,
@@ -105,12 +101,13 @@ class BitgetClient:
             "Content-Type": "application/json",
         }
 
+        # 4) 요청 (params 사용하지 않음: 순서가 깨질 수 있음)
         resp = self.session.request(
-            method=method_u,
-            url=url,                 # params는 이미 URL에 포함 (순서 보존)
+            method=m,
+            url=url,
             headers=headers,
             params=None,
-            data=raw_body if method_u != "GET" else None,
+            data=raw_body if m != "GET" else None,
             timeout=self.timeout,
         )
 
@@ -121,7 +118,7 @@ class BitgetClient:
                 detail = {"raw": resp.text}
             self.log.error(
                 "Bitget HTTP %s %s -> %s | url=%s | body=%s",
-                method_u, path, resp.status_code, resp.url, raw_body if raw_body else ""
+                m, path, resp.status_code, resp.url, raw_body if raw_body else ""
             )
             self.log.error("Bitget response: %s", detail)
             resp.raise_for_status()
@@ -132,18 +129,15 @@ class BitgetClient:
 
     def get_net_position(self, symbol: str) -> Dict[str, float]:
         """
-        Return {'net': float}  (one-way 기준: longQty - shortQty)
-
-        Safe strategy:
-        1) Try singlePosition with (symbol, marginCoin) ONLY
-        2) If 4xx, fallback to allPosition(productType) and filter by symbol
+        {'net': float} 반환 (one-way 기준: longQty - shortQty)
+        1) singlePosition(symbol, marginCoin) 시도
+        2) 4xx면 allPosition(productType)로 폴백 후 심볼 필터
         """
-        # 1) Primary: singlePosition(symbol, marginCoin)
+        # primary
         path = "/api/mix/v1/position/singlePosition"
         params = {
             "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            # NOTE: productType intentionally omitted here (causes 400 in some regions)
+            "marginCoin": self.margin_coin,  # productType은 일부 리전에서 400 유발
         }
         try:
             res = self._request("GET", path, params=params)
@@ -154,7 +148,7 @@ class BitgetClient:
             net = long_qty - short_qty
             return {"net": net}
         except requests.HTTPError:
-            # 2) Fallback: allPosition(productType), then filter the symbol
+            # fallback
             path2 = "/api/mix/v1/position/allPosition"
             params2 = {"productType": self.product_type}
             res2 = self._request("GET", path2, params=params2)
@@ -167,25 +161,12 @@ class BitgetClient:
                     break
             return {"net": net}
 
-    # ---- hedge helpers ----
-    @staticmethod
-    def _map_side_for_hedge(logical_side: str, reduce_only: bool) -> str:
-        """
-        Convert logical side (buy/sell + reduce_only) to hedge side string.
-        """
-        s = logical_side.lower()
-        if not reduce_only:
-            return "open_long" if s == "buy" else "open_short"
-        # reduce_only=True: reduce opposite leg
-        return "close_short" if s == "buy" else "close_long"
-
-    # core sender used by place_order (with optional override side)
     def _send_place_order(
         self,
         *,
         tv_symbol: str,
-        side: str,
-        order_type: str,
+        side: str,            # "buy" | "sell"
+        order_type: str,      # "market" | "limit"
         size: str,
         reduce_only: bool,
         client_oid: Optional[str],
@@ -197,7 +178,7 @@ class BitgetClient:
             "symbol": tv_symbol,
             "marginCoin": self.margin_coin,
             "productType": self.product_type,
-            "side": side,
+            "side": side,                            # 원웨이: buy/sell
             "orderType": order_type.lower(),
             "size": str(size),
             "reduceOnly": bool(reduce_only),
@@ -210,26 +191,24 @@ class BitgetClient:
             body["timeInForceValue"] = time_in_force
         return self._request("POST", path, body=body)
 
-def place_order(
-    self,
-    *,
-    tv_symbol: str,
-    side: str,               # "buy" | "sell" (one-way)
-    order_type: str,         # "market" | "limit"
-    size: str,
-    reduce_only: bool = False,
-    client_oid: Optional[str] = None,
-    price: Optional[str] = None,
-    time_in_force: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    One-way 전용: buy/sell만 사용.
-    (이 버전은 hedge 재시도를 하지 않습니다.)
-    """
-    try:
+    def place_order(
+        self,
+        *,
+        tv_symbol: str,
+        side: str,               # "buy" | "sell" (one-way)
+        order_type: str,         # "market" | "limit"
+        size: str,
+        reduce_only: bool = False,
+        client_oid: Optional[str] = None,
+        price: Optional[str] = None,
+        time_in_force: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        One-way 전용 주문. hedge 재시도 없음.
+        """
         return self._send_place_order(
             tv_symbol=tv_symbol,
-            side=side,                     # ← buy / sell 그대로
+            side=side,
             order_type=order_type,
             size=size,
             reduce_only=reduce_only,
@@ -237,11 +216,3 @@ def place_order(
             price=price,
             time_in_force=time_in_force,
         )
-    except requests.HTTPError as e:
-        # 디버깅 보조용 로그만 남기고 그대로 올림
-        try:
-            j = e.response.json()
-            self.log.error("place_order failed(one-way): code=%s msg=%s", j.get("code"), j.get("msg"))
-        except Exception:
-            pass
-        raise
