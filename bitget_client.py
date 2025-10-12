@@ -1,268 +1,286 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
 import hashlib
 import hmac
 import json
-import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
 
-class BitgetHTTPError(requests.HTTPError):
-    def __init__(self, message: str, detail: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.detail = detail or {}
+class BitgetHTTPError(Exception):
+    pass
 
 
 class BitgetClient:
     """
-    Bitget USDT-M Perp (umcbl) 전용 간단 클라이언트.
-    - 포지션 조회(헤지), 마켓 주문, TP 등록(Plan) 지원
-    - 오류/형태 다양성에 최대한 내성 있게 파싱
+    최소한의 Bitget U本位(UMCBL) 선물 연동 래퍼.
+    - 네트워크/Bitget 오류 메시지를 풍부하게 남기도록 _request 강화
+    - singlePosition 조회 시 productType=umcbl 명시 (400 방지)
+    - 응답이 dict/list 어느 쪽이어도 파싱되게 방어코드
     """
-
-    BASE = "https://api.bitget.com"
 
     def __init__(
         self,
         api_key: str,
         api_secret: str,
         passphrase: str,
-        product_type: str = "umcbl",
-        margin_coin: str = "USDT",
-        timeout: int = 10,
-        logger: Optional[logging.Logger] = None,
-    ):
+        base_url: str = "https://api.bitget.com",
+        timeout: float = 8.0,
+        user_agent: str = "siu-autotrade/1.0",
+    ) -> None:
         self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8")
+        self.api_secret = api_secret
         self.passphrase = passphrase
-        self.product_type = product_type
-        self.margin_coin = margin_coin
+        self.base = base_url.rstrip("/")
         self.timeout = timeout
-        self.log = logger or logging.getLogger(__name__)
 
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Content-Type": "application/json",
-                "X-ACCESS-KEY": self.api_key,
-                "X-ACCESS-PASSPHRASE": self.passphrase,
-            }
-        )
+        self.session.headers.update({"User-Agent": user_agent})
 
-    # ------------------------
-    # Low-level helpers
-    # ------------------------
-    @staticmethod
-    def _ts_ms() -> str:
-        return str(int(time.time() * 1000))
+    # -------------------------------------------------------------------------
+    # 내부 공용
+    # -------------------------------------------------------------------------
 
-    def _sign(self, ts: str, method: str, path: str, body: str) -> str:
-        raw = f"{ts}{method}{path}{body}".encode("utf-8")
-        sig = hmac.new(self.api_secret, raw, hashlib.sha256).hexdigest()
-        return sig
+    def _sign(
+        self,
+        ts_ms: str,
+        method: str,
+        path: str,
+        params: Dict[str, Any],
+        body: Dict[str, Any],
+    ) -> str:
+        query = ""
+        if params:
+            # Bitget는 Query string을 key=value&key2=value2 순으로 붙여 넣어야 함
+            query = "?" + "&".join(
+                f"{k}={params[k]}" for k in sorted(params.keys())
+            )
+
+        payload = ""
+        if body:
+            payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        prehash = ts_ms + method.upper() + path + query + payload
+        digest = hmac.new(
+            self.api_secret.encode("utf-8"),
+            prehash.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+        return digest
 
     def _request(
         self,
-        method: str,
+        m: str,
         path: str,
-        *,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """서명/전송/오류 내성 포함 공통 요청"""
-        url = self.BASE + path
-        m = method.upper()
-        data_txt = json.dumps(body) if body else ""
-        ts = self._ts_ms()
-        sign = self._sign(ts, m, path, data_txt)
+    ):
+        """
+        Bitget REST 요청. 2xx가 아니면 Bitget code/msg와 함께 예외 발생.
+        """
+        url = self.base + path
+        ts = str(int(time.time() * 1000))
+        q = params or {}
+        b = body or {}
 
+        sign = self._sign(ts, m, path, q, b)
         headers = {
-            "X-ACCESS-TIMESTAMP": ts,
-            "X-ACCESS-SIGN": sign,
+            "Content-Type": "application/json",
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-PASSPHRASE": self.passphrase,
         }
-        try:
-            resp = self.session.request(
-                m,
-                url,
-                params=params,
-                data=data_txt if body else None,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as e:
-            raise BitgetHTTPError(f"network-error: {e}") from e
 
-        # HTTP 오류 -> Bitget 에러에 맞춰 detail 뽑기
-        if not resp.ok:
-            detail = {}
+        resp = self.session.request(
+            method=m,
+            url=url,
+            params=q,
+            json=b if b else None,
+            headers=headers,
+            timeout=self.timeout,
+        )
+
+        # 2xx면 정상
+        if 200 <= resp.status_code < 300:
             try:
-                detail = resp.json()
+                data = resp.json()
             except Exception:
-                detail = {"raw": resp.text}
+                raise BitgetHTTPError(
+                    f"bitget-http invalid-json status={resp.status_code} body={resp.text[:300]}"
+                )
+            # Bitget 표준 성공 코드는 '00000'
+            if isinstance(data, dict) and data.get("code") not in (None, "00000", 0):
+                raise BitgetHTTPError(
+                    f"bitget-http code={data.get('code')} msg={data.get('msg')}"
+                )
+            # 보통 'data' 필드에 실제 페이로드가 들어옴
+            return data.get("data", data)
+
+        # 비정상: Bitget의 code/msg를 최대한 추출해 로그 풍부화
+        try:
+            j = resp.json()
+            code = j.get("code")
+            msg = j.get("msg")
             raise BitgetHTTPError(
-                f"bitget-http status={resp.status_code}", detail=detail
+                f"bitget-http status={resp.status_code} code={code} msg={msg}"
+            )
+        except Exception:
+            raise BitgetHTTPError(
+                f"bitget-http status={resp.status_code} body={resp.text[:300]}"
             )
 
-        try:
-            payload = resp.json()
-        except Exception:
-            raise BitgetHTTPError("invalid-json", {"raw": resp.text})
+    # -------------------------------------------------------------------------
+    # 조회/포지션
+    # -------------------------------------------------------------------------
 
-        # Bitget 표준 포맷 검사
-        code = str(payload.get("code", ""))
-        if code not in ("00000", "0", "success", "Success"):  # '0' 대응
-            raise BitgetHTTPError("bitget-error", payload)
-
-        return payload
-
-    # ------------------------
-    # Public helpers
-    # ------------------------
-    def _client_oid(self, tag: str) -> str:
-        return f"tv-{int(time.time()*1000)}-{tag}"
-
-    # 가격 조회 (체결가 없을 때 보정용)
-    def get_ticker_last(self, symbol: str) -> float:
-        try:
-            res = self._request(
-                "GET",
-                "/api/mix/v1/market/ticker",
-                params={"symbol": symbol, "productType": self.product_type},
-            )
-            data = res.get("data", {}) or {}
-            last = data.get("last") or data.get("close")
-            return float(last or 0)
-        except Exception:
-            return 0.0
-
-    # 포지션 사이즈(Long/Short) 조회 - 다양한 응답형태 방어
-    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
+    def get_hedge_sizes(self, symbol: str) -> Tuple[float, float]:
+        """
+        현재 심볼의 헤지 모드 포지션 수량(long/short)을 반환.
+        Bitget가 상황에 따라 data를 dict/list 어느 쪽으로 주는지 몰라서 전부 대비.
+        또한 일부 환경에서 productType=umcbl을 요구하므로 명시한다.
+        """
         path = "/api/mix/v1/position/singlePosition"
         params = {
             "symbol": symbol,
-            "productType": self.product_type,
-            "marginCoin": self.margin_coin,
+            "marginCoin": "USDT",
+            "productType": "umcbl",  # ★ 400 방지
         }
-        res = self._request("GET", path, params=params)
-        data = res.get("data", {})
+        data = self._request("GET", path, params=params)
 
-        items: list[dict] = []
+        # data가 dict일 수도, list일 수도 있음
         if isinstance(data, dict):
-            # 흔한 형태: {"list":[...]} | {"positions":[...]} | 단일 dict 등
-            items = (
-                data.get("list")
-                or data.get("positions")
-                or ([data] if data else [])
-            )
-            if isinstance(items, dict):
-                items = [items]
-        elif isinstance(data, list):
-            items = data
+            items: List[Dict[str, Any]] = data.get("data") or data.get("positions") or []
+        else:
+            items = data or []
 
         long_sz = 0.0
         short_sz = 0.0
 
-        for it in items:
-            side = (
-                it.get("holdSide")
-                or it.get("side")
-                or it.get("positionSide")
-                or it.get("posSide")
-                or ""
-            ).lower()
-            # 수량 후보키 다양성 고려
-            qty = (
-                it.get("available")
-                or it.get("total")
-                or it.get("size")
-                or it.get("holdVolume")
-                or 0
-            )
+        def _to_f(x) -> float:
             try:
-                fqty = float(qty or 0)
+                return float(x)
             except Exception:
-                fqty = 0.0
+                return 0.0
 
-            if side.startswith("long"):
-                long_sz += fqty
-            elif side.startswith("short"):
-                short_sz += fqty
+        for it in items:
+            hold = (it.get("holdSide") or it.get("side") or "").lower()
+            # 크기 키 이름이 환경에 따라 다를 수 있어 방어적 파싱
+            size = _to_f(it.get("total") or it.get("totalSize") or it.get("available") or 0)
+            if hold == "long":
+                long_sz = size
+            elif hold == "short":
+                short_sz = size
 
-        return {"long": float(long_sz), "short": float(short_sz)}
+        return long_sz, short_sz
 
-    # ------------------------
-    # Orders (market)
-    # ------------------------
+    # -------------------------------------------------------------------------
+    # 주문
+    # -------------------------------------------------------------------------
+
     def place_order(
         self,
         symbol: str,
-        side: str,
-        order_type: str,
-        size: str,
+        side: str,  # "buy" | "sell"
+        size: float,
+        order_type: str = "market",  # "market" | "limit"
         reduce_only: bool = False,
+        client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        일반 주문(시장가/지정가). Hedge 모드 사용.
+        side: "buy"(=LONG 오픈 or SHORT 청산), "sell"(=SHORT 오픈 or LONG 청산)
+        """
         path = "/api/mix/v1/order/placeOrder"
         body = {
             "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            "productType": self.product_type,
-            "side": side,             # open_long/open_short/close_long/close_short/buy/sell
-            "orderType": order_type,  # market/limit
-            "size": size,
+            "marginCoin": "USDT",
+            "productType": "umcbl",
+            "side": side,
+            "orderType": order_type,
+            "size": f"{size:.6f}",
             "reduceOnly": reduce_only,
-            "clientOid": self._client_oid(side),
+        }
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        return self._request("POST", path, body=body)
+
+    # 전량 청산(holdSide 기준)
+    def close_all(
+        self,
+        symbol: str,
+        hold_side: str,  # "long" | "short"
+    ) -> Dict[str, Any]:
+        """
+        해당 holdSide 전량 청산 (시장가)
+        """
+        if hold_side.lower() not in ("long", "short"):
+            raise ValueError("hold_side must be 'long' or 'short'")
+
+        path = "/api/mix/v1/position/closePosition"
+        body = {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "productType": "umcbl",
+            "holdSide": hold_side.lower(),
         }
         return self._request("POST", path, body=body)
 
-    def open_long(self, symbol: str, size: str, order_type: str = "market"):
-        return self.place_order(symbol, "open_long", order_type, size, reduce_only=False)
+    # -------------------------------------------------------------------------
+    # TP 설정 (포지션 기준으로 TP만)
+    # -------------------------------------------------------------------------
 
-    def open_short(self, symbol: str, size: str, order_type: str = "market"):
-        return self.place_order(symbol, "open_short", order_type, size, reduce_only=False)
-
-    def close_long(self, symbol: str, size: str, order_type: str = "market"):
-        return self.place_order(symbol, "close_long", order_type, size, reduce_only=True)
-
-    def close_short(self, symbol: str, size: str, order_type: str = "market"):
-        return self.place_order(symbol, "close_short", order_type, size, reduce_only=True)
-
-    # ------------------------
-    # TP(Plan) – 주문 이후 등록 (ROI 기준)
-    # ------------------------
-    def place_take_profit_by_roi(
+    def set_tp_percent(
         self,
         symbol: str,
-        side: str,            # 'long' | 'short'
-        entry_price: float,
-        leverage: float,
-        roi_target: float = 0.07,  # 7% 기본
-    ):
+        hold_side: str,  # "long" | "short"
+        percent: float,  # 0.07 = +7%
+        entry_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        ROI 기준으로 TP가격 계산 후 Plan 주문 생성.
-        ROI% = 가격변동률% × 레버리지  =>  가격변동률 = ROI / 레버리지
+        포지션 기준 TP(익절) 플랜 등록. percent는 +7% == 0.07 처럼 전달.
+        - entry_price가 없으면 singlePosition 정보에서 평균가를 추정.
+        - Bitget POST /api/mix/v1/plan/placeTPSL 사용.
         """
-        path = "/api/mix/v1/plan/placePlan"
+        # 평균가가 없으면 조회
+        if entry_price is None:
+            path = "/api/mix/v1/position/singlePosition"
+            params = {
+                "symbol": symbol,
+                "marginCoin": "USDT",
+                "productType": "umcbl",
+            }
+            data = self._request("GET", path, params=params)
+            avg = None
+            items = data.get("data") if isinstance(data, dict) else (data or [])
+            for it in items or []:
+                hs = (it.get("holdSide") or it.get("side") or "").lower()
+                if hs == hold_side.lower():
+                    avg = it.get("averageOpenPrice") or it.get("avgPrice") or it.get("openPrice")
+                    break
+            try:
+                entry_price = float(avg) if avg is not None else None
+            except Exception:
+                entry_price = None
 
-        if side.lower() == "long":
-            tp_price = entry_price * (1 + roi_target / leverage)
-            side_type = "long"
-        else:
-            tp_price = entry_price * (1 - roi_target / leverage)
-            side_type = "short"
+        if not entry_price or entry_price <= 0:
+            # 평균가를 못 찾으면 TP 설정은 스킵 (주문 자체는 이미 체결됐으므로 동작엔 지장 없음)
+            return None
 
+        if hold_side.lower() == "long":
+            trigger_price = entry_price * (1.0 + percent)
+        else:  # short
+            trigger_price = entry_price * (1.0 - percent)
+
+        path = "/api/mix/v1/plan/placeTPSL"
         body = {
             "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            "planType": "profit_plan",
-            "triggerPrice": f"{tp_price:.2f}",
-            "executePrice": f"{tp_price:.2f}",
+            "marginCoin": "USDT",
+            "productType": "umcbl",
+            "planType": "tp",            # take-profit
             "triggerType": "market_price",
-            "side": side_type,
-            "size": "0",  # 전량
+            "triggerPrice": f"{trigger_price:.2f}",
+            "holdSide": hold_side.lower(),
         }
-        self.log.info(f"[TP] ROI {roi_target*100:.2f}% ({side_type}) @ {tp_price:.2f}")
         return self._request("POST", path, body=body)
