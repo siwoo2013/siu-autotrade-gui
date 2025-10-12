@@ -6,31 +6,25 @@ from __future__ import annotations
 import os
 import re
 import json
-import time
 import logging
 from pathlib import Path
 from typing import Any, Dict
 
+import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from bitget_client import BitgetClient
 
-
-# ===== 기본 설정 =============================================================
-
+# ===== Env & mode ============================================================
 APP_NAME = "siu-autotrade-gui"
 BASE_DIR = Path(__file__).resolve().parent
 
-# Render 환경변수
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-
-# 운영 모드(문자열) – live / demo (서버 표시용)
+# 1) TRADE_MODE (live|demo)이 우선
 TRADE_MODE = os.getenv("TRADE_MODE", "demo").lower()
-# 예전 호환: DEMO=true/false
+
+# 2) DEMO 환경변수(하위호환)
 if os.getenv("DEMO") is not None:
     DEMO = os.getenv("DEMO", "false").lower() in ["1", "true", "yes", "on"]
 else:
@@ -38,171 +32,190 @@ else:
 
 MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-strong-secret").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
 
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "").strip()
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "").strip()
 
-# ===== 로깅 ==================================================================
+PRODUCT_TYPE = "umcbl"  # U-margined perpetual
 
+# ===== Logger ================================================================
 logger = logging.getLogger(APP_NAME)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(_handler)
 
-
-# ===== FastAPI ==============================================================
-
+# ===== FastAPI ===============================================================
 app = FastAPI(title=APP_NAME)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-# ===== 유틸 함수 =============================================================
-
-def safe_json_loads(raw: str) -> Dict[str, Any]:
-    """
-    TV 메시지 앞에 안내 문구가 붙는 경우가 있어
-    첫 '{'부터 끝 '}'까지를 잘라 JSON만 파싱.
-    """
-    i = raw.find("{")
-    j = raw.rfind("}")
-    if i >= 0 and j > i:
-        raw = raw[i:j + 1]
-    return json.loads(raw)
-
-
-def normalize_symbol(sym: str) -> str:
-    """
-    TradingView에서 넘어오는 심볼을 Bitget REST 심볼로 변환.
-    - BTCUSDT.P  -> BTCUSDT_UMCBL (USDT-M Perp)
-    - BTCUSDT.P_UMCBL -> BTCUSDT_UMCBL (이미 형식일 수도 있음)
-    기타 .P, PERP, _UMCBL 변형을 넉넉히 수용.
-    """
-    s = sym.strip().upper()
-    # 이미 _UMCBL 붙은 경우 정규화만
-    if s.endswith("_UMCBL"):
-        base = s.replace(".P", "").replace("_UMCBL", "")
-        return f"{base}_UMCBL"
-
-    # .P, .PERP 등 제거 후 UMCBL 부착
-    base = re.sub(r"(\.P(ERP)?)$", "", s)
-    base = base.replace("_UMCBL", "")
-    return f"{base}_UMCBL"
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-# ===== Bitget 클라이언트 =====================================================
-
-# 생성자에 demo/trade_mode 인자 전달하지 않습니다(최근 버전 기준).
+# ===== Bitget Client 인스턴스 ================================================
 _bg = BitgetClient(
     api_key=BITGET_API_KEY,
     api_secret=BITGET_API_SECRET,
     passphrase=BITGET_PASSPHRASE,
-    product_type="umcbl",      # USDT-M perpetual
+    product_type=PRODUCT_TYPE,
+    demo=DEMO,
     logger=logger,
 )
 
+# ===== 유틸 ==================================================================
+def normalize_symbol(tv_symbol: str) -> str:
+    """
+    TradingView에서 오는 심볼(BTCUSDT.P, BTCUSDTPERP 등)을
+    Bitget U-Perp 표기(BTCUSDT_UMCBL)로 정규화.
+    """
+    s = tv_symbol.upper().strip()
 
-# ===== 헬스 체크 =============================================================
+    # 끝의 .P / PERP / U / U:PERP / PERPETUAL 등 제거
+    s = re.sub(r"\.P$", "", s)
+    s = re.sub(r"PERP(ETUAL)?$", "", s)
+    s = s.replace(":", "")
 
+    # 가장 단순형 BTCUSDT 로 통일
+    # (예: BTCUSDT.P, BTCUSDT, BTCUSDT_PERP, BTCUSDTU -> BTCUSDT)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+
+    if not s.endswith("_UMCBL"):
+        s = f"{s}_UMCBL"
+    return s
+
+
+def side_map_for_oneway(target_side: str) -> Dict[str, str]:
+    """
+    TradingView target_side(BUY/SELL)를 오픈/클로즈에 쓸 실제 비트겟 side로 맵핑.
+    - 오픈: BUY -> buy / SELL -> sell
+    - 클로즈: BUY의 반대는 sell, SELL의 반대는 buy (reduceOnly=True)
+    """
+    t = target_side.upper()
+    if t not in ("BUY", "SELL"):
+        raise ValueError("target_side must be BUY or SELL")
+
+    side_open = "buy" if t == "BUY" else "sell"
+    side_close = "sell" if t == "BUY" else "buy"
+    return {"open": side_open, "close": side_close}
+
+
+# ===== Routes ================================================================
 @app.get("/")
-async def root():
-    return {"ok": True, "service": APP_NAME, "mode": "demo" if DEMO else "live"}
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "mode": "demo" if DEMO else "live",
+    }
 
-
-# ===== TV Webhook ============================================================
 
 @app.post("/tv")
-async def tv_webhook(request: Request) -> Response:
-    raw = await request.body()
-    body_text = raw.decode("utf-8", errors="ignore").strip()
-
+async def tv_webhook(req: Request):
+    """
+    TradingView → Render Webhook 엔드포인트
+    body 예:
+    {
+      "secret": "...",
+      "route": "order.reverse",
+      "exchange": "bitget",
+      "symbol": "BTCUSDT.P",
+      "target_side": "BUY",  # or SELL
+      "type": "MARKET",      # MARKET만 지원
+      "size": 0.001
+    }
+    """
+    body = await req.body()
     try:
-        data = safe_json_loads(body_text)
+        payload = json.loads(body.decode("utf-8"))
     except Exception:
-        logger.error("Invalid JSON RAW: %s", body_text)
         return JSONResponse({"ok": False, "error": "invalid-json"}, status_code=400)
 
-    # 시크릿 검사
-    if data.get("secret", "").strip() != WEBHOOK_SECRET:
+    # 1) 보안
+    if payload.get("secret") != WEBHOOK_SECRET:
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-    route = str(data.get("route", "")).strip()          # "order.reverse"
-    exchange = str(data.get("exchange", "")).strip()     # "bitget"
-    symbol_in = str(data.get("symbol", "")).strip()      # e.g. "BTCUSDT.P", "BTCUSDT.P_UMCBL"
-    target_side = str(data.get("target_side", "")).upper().strip()  # "BUY"/"SELL"
-    ord_type = str(data.get("type", "MARKET")).upper().strip()
-    size = data.get("size", 0)
+    route = payload.get("route", "")
+    exchange = payload.get("exchange", "").lower()
+    tv_symbol = payload.get("symbol", "")
+    target_side = payload.get("target_side", "").upper()
+    ord_type = payload.get("type", "MARKET").upper()
+    size = payload.get("size", 0)
 
-    # 숫자 size 보정
-    try:
-        size = float(size)
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid-size"}, status_code=400)
-
-    symbol = normalize_symbol(symbol_in)
+    symbol = normalize_symbol(tv_symbol)
 
     logger.info(
         "%s [TV] 수신 | %s | %s | %s | size=%.6f",
-        MODE_TAG, symbol, route, target_side, size
+        MODE_TAG,
+        symbol,
+        route,
+        target_side,
+        float(size or 0),
     )
 
-    if exchange.lower() != "bitget":
+    if exchange != "bitget":
         return JSONResponse({"ok": False, "error": "unsupported-exchange"}, status_code=400)
 
-    if route != "order.reverse":
+    if route not in ("order.reverse", "order.open"):
         return JSONResponse({"ok": False, "error": "unsupported-route"}, status_code=400)
 
-    # client_oid (선택)
-    client_oid = f"tv-{now_ms()}"
-
-    # 원웨이 모드 전제:
-    #  - reverse: 들어온 side(예: BUY)면 기존 반대 포지션(SELL)을 닫고 -> 요청 side 방향으로 포지션 잡기
-    #  - 구현: 'side mismatch(400172)' 가 날 때 reduceOnly close 후 다시 open
-
-    side_open = "buy" if target_side == "BUY" else "sell"
-    opposite_side = "sell" if side_open == "buy" else "buy"
-
+    # 오픈/클로즈 맵
     try:
-        # 1) 우선 정방향으로 오픈 시도
+        sides = side_map_for_oneway(target_side)
+    except ValueError as ve:
+        return JSONResponse({"ok": False, "error": str(ve)}, status_code=400)
+
+    side_open = sides["open"]
+    side_close = sides["close"]
+
+    client_oid = f"tv-{int(os.times().elapsed*1000)}"
+
+    # === 1) 우선 '오픈' 시도 =================================================
+    try:
         _bg.place_order(
-            tv_symbol=symbol,            # <- 파라미터명 tv_symbol 로 통일
-            side=side_open,              # "buy"/"sell"
-            order_type=ord_type.lower(), # "market"
+            tv_symbol=symbol,                # BitgetClient는 tv_symbol로 받음(내부정규화)
+            side=side_open,                  # buy/sell
+            order_type=ord_type.lower(),     # market/limit (여기선 market)
             size=size,
             reduce_only=False,
             client_oid=client_oid,
         )
         return JSONResponse({"ok": True, "action": "open", "side": side_open})
 
-    except Exception as e1:
-        # place_order 가 HTTPError(detail 포함)를 올려줌
-        msg = str(e1)
-        if "400172" not in msg and "side mismatch" not in msg:
-            # 다른 오류면 그대로 리턴
-            logger.error("Exception in /tv (open): %s", msg)
-            return JSONResponse({"ok": False, "error": "open-failed", "detail": msg}, status_code=500)
-
-        # 2) side mismatch → 강제 reduceOnly close 먼저
+    except requests.HTTPError as e1:
+        # 원웨이에서 반대 포지션 보유시 발생하는 400172(side mismatch) 등 400번
+        status = getattr(e1, "response", None).status_code if getattr(e1, "response", None) else None
+        msg = ""
         try:
-            logger.info("side mismatch on OPEN -> force CLOSE first: %s (size=%s)", opposite_side, size)
+            msg = e1.response.text  # 서버가 내려준 본문
+        except Exception:
+            msg = str(e1)
+
+        # 400이 아니고, 본문에도 side mismatch 없으면 그냥 에러 리턴
+        if status != 400 and "side mismatch" not in msg:
+            logger.error("Exception in /tv (open): %s", str(e1))
+            return JSONResponse({"ok": False, "error": "open-failed", "detail": str(e1)}, status_code=500)
+
+        # === 2) 강제 reduceOnly CLOSE 후 재오픈 ==============================
+        try:
+            logger.info("side mismatch on OPEN -> force CLOSE first: %s (size=%s)", side_close, size)
             _bg.place_order(
                 tv_symbol=symbol,
-                side=opposite_side,
+                side=side_close,              # 반대 방향
                 order_type=ord_type.lower(),
                 size=size,
-                reduce_only=True,
+                reduce_only=True,             # 강제 청산
                 client_oid=f"{client_oid}-close",
             )
         except Exception as e_close:
+            # 강제청산 실패해도 이후 오픈 재시도는 해 본다
             logger.error("force close failed (continue to OPEN): %s", str(e_close))
 
-        # 3) close 이후 다시 오픈 시도
         try:
             _bg.place_order(
                 tv_symbol=symbol,
@@ -213,11 +226,22 @@ async def tv_webhook(request: Request) -> Response:
                 client_oid=f"{client_oid}-open",
             )
             return JSONResponse({
-                "ok": True, "action": "force-close-then-open",
-                "close_side": opposite_side, "open_side": side_open
+                "ok": True,
+                "action": "force-close-then-open",
+                "close_side": side_close,
+                "open_side": side_open
             })
         except Exception as e2:
             logger.error("Exception in /tv (re-open): %s", str(e2))
-            return JSONResponse({
-                "ok": False, "error": "reopen-failed", "detail": str(e2)
-            }, status_code=500)
+            return JSONResponse({"ok": False, "error": "reopen-failed", "detail": str(e2)}, status_code=500)
+
+    except Exception as e1:
+        logger.error("Exception in /tv (open/unknown): %s", str(e1))
+        return JSONResponse({"ok": False, "error": "open-failed", "detail": str(e1)}, status_code=500)
+
+
+# ===== Uvicorn Entrypoint ====================================================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
