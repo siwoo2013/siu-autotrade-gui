@@ -35,6 +35,32 @@ bg = BitgetClient(
     logger=logger,
 )
 
+# ---------- helpers ----------
+
+def normalize_symbol(sym: str) -> str:
+    """
+    TradingView 등에서 오는 다양한 표기 -> Bitget UMCBL 심볼로 정규화.
+    예)
+      BTCUSDT.P   -> BTCUSDT_UMCBL
+      BTCUSDT     -> BTCUSDT_UMCBL
+      btcusdt_umcbl -> BTCUSDT_UMCBL
+    이미 _UMCBL 이면 그대로 반환.
+    """
+    if not sym:
+        return "BTCUSDT_UMCBL"
+    s = sym.strip().upper()
+    if s.endswith("_UMCBL"):
+        return s
+    if s.endswith(".P"):          # ex) BTCUSDT.P
+        core = s[:-2]
+        if core.endswith("USDT"):
+            return core + "_UMCBL"
+    if s.endswith("USDT"):        # ex) BTCUSDT
+        return s + "_UMCBL"
+    # 기타 케이스는 그대로(혹은 여기서 더 매핑 추가 가능)
+    return s
+
+
 # ---------- routes ----------
 
 @app.get("/")
@@ -61,7 +87,10 @@ async def tv(request: Request):
     # 2) 필드
     route = str(payload.get("route", "")).strip()
     exchange = str(payload.get("exchange", "bitget")).lower()
-    symbol = str(payload.get("symbol", "BTCUSDT_UMCBL")).strip()
+
+    raw_symbol = str(payload.get("symbol", "BTCUSDT_UMCBL")).strip()
+    symbol = normalize_symbol(raw_symbol)
+
     target_side = str(payload.get("target_side", "")).upper()  # BUY / SELL
     order_type = str(payload.get("type", "MARKET")).lower()    # market / limit
     size = str(payload.get("size", "0.001"))
@@ -69,7 +98,10 @@ async def tv(request: Request):
     if exchange != "bitget":
         return JSONResponse({"ok": False, "error": "unsupported-exchange"}, status_code=400)
 
-    logger.info("[LIVE] [TV] 수신 | %s | %s | %s | size=%s", symbol, route, target_side, size)
+    logger.info(
+        "[LIVE] [TV] 수신 | raw_symbol=%s -> symbol=%s | %s | %s | size=%s",
+        raw_symbol, symbol, route, target_side, size
+    )
 
     # --- open/close helpers ---
     def open_by_side(side: str):
