@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -35,38 +36,77 @@ bg = BitgetClient(
     logger=logger,
 )
 
-# ---------- helpers ----------
-
+# ---------- symbol normalize / lock ----------
 def normalize_symbol(sym: str) -> str:
-    """
-    TradingView 등에서 오는 다양한 표기 -> Bitget UMCBL 심볼로 정규화.
-    예)
-      BTCUSDT.P   -> BTCUSDT_UMCBL
-      BTCUSDT     -> BTCUSDT_UMCBL
-      btcusdt_umcbl -> BTCUSDT_UMCBL
-    이미 _UMCBL 이면 그대로 반환.
-    """
     if not sym:
         return "BTCUSDT_UMCBL"
     s = sym.strip().upper()
     if s.endswith("_UMCBL"):
         return s
-    if s.endswith(".P"):          # ex) BTCUSDT.P
-        core = s[:-2]
-        if core.endswith("USDT"):
-            return core + "_UMCBL"
-    if s.endswith("USDT"):        # ex) BTCUSDT
+    if s.endswith(".P"):
+        s = s[:-2]
+    if s.endswith("USDT"):
         return s + "_UMCBL"
-    # 기타 케이스는 그대로(혹은 여기서 더 매핑 추가 가능)
     return s
 
+_symbol_locks: dict[str, asyncio.Lock] = {}
+
+def symbol_lock(symbol: str) -> asyncio.Lock:
+    if symbol not in _symbol_locks:
+        _symbol_locks[symbol] = asyncio.Lock()
+    return _symbol_locks[symbol]
+
+# ---------- helpers ----------
+async def sleep_ms(ms: int):  # 짧은 대기
+    await asyncio.sleep(ms / 1000.0)
+
+async def ensure_close_full(symbol: str, side_to_close: str, *, max_retry: int = 3) -> Dict[str, Any]:
+    """
+    side_to_close: "LONG" or "SHORT"
+    - 현재 반대 레그의 '보유 수량'을 조회 후 '전량 청산'을 재시도하며 확인한다.
+    - 네트워크/일시 에러에 대해 재시도.
+    - 성공적으로 0이 되면 {"ok": True, "closed": ...} 반환, 아니면 {"ok": False, ...}
+    """
+    last_detail: Any = None
+    for attempt in range(1, max_retry + 1):
+        sizes = bg.get_hedge_sizes(symbol)
+        long_sz = float(sizes["long"])
+        short_sz = float(sizes["short"])
+        logger.info("ensure_close_full #%s | %s sizes(long=%.6f, short=%.6f)", attempt, symbol, long_sz, short_sz)
+
+        try:
+            if side_to_close == "LONG" and long_sz > 0:
+                bg.close_long(symbol, size=str(long_sz))
+            elif side_to_close == "SHORT" and short_sz > 0:
+                bg.close_short(symbol, size=str(short_sz))
+            else:
+                # 이미 닫혀 있음
+                return {"ok": True, "closed": {"skipped": True, "reason": "already_zero"}}
+        except requests.RequestException as e:
+            # 네트워크/HTTP 에러: detail 저장 후 재시도
+            try:
+                last_detail = e.response.json()  # type: ignore[assignment]
+            except Exception:
+                last_detail = {"raw": getattr(e.response, "text", "") if getattr(e, "response", None) else str(e)}
+            logger.info("close attempt error (will retry): %s", last_detail)
+
+        # 체결 반영 대기 후 재확인
+        await sleep_ms(300)
+        sizes2 = bg.get_hedge_sizes(symbol)
+        long2 = float(sizes2["long"])
+        short2 = float(sizes2["short"])
+        if side_to_close == "LONG" and long2 <= 0:
+            return {"ok": True, "closed": {"size_before": long_sz, "size_after": long2}}
+        if side_to_close == "SHORT" and short2 <= 0:
+            return {"ok": True, "closed": {"size_before": short_sz, "size_after": short2}}
+
+    return {"ok": False, "error": "close_not_flat", "detail": last_detail}
 
 # ---------- routes ----------
 
 @app.get("/")
 def health() -> Dict[str, Any]:
     return {"ok": True, "service": "siu-autotrade-gui", "mode": TRADE_MODE}
-
 
 @app.post("/tv")
 async def tv(request: Request):
@@ -87,84 +127,61 @@ async def tv(request: Request):
     # 2) 필드
     route = str(payload.get("route", "")).strip()
     exchange = str(payload.get("exchange", "bitget")).lower()
-
     raw_symbol = str(payload.get("symbol", "BTCUSDT_UMCBL")).strip()
     symbol = normalize_symbol(raw_symbol)
-
     target_side = str(payload.get("target_side", "")).upper()  # BUY / SELL
-    order_type = str(payload.get("type", "MARKET")).lower()    # market / limit
+    order_type = str(payload.get("type", "MARKET")).lower()
     size = str(payload.get("size", "0.001"))
 
     if exchange != "bitget":
         return JSONResponse({"ok": False, "error": "unsupported-exchange"}, status_code=400)
 
-    logger.info(
-        "[LIVE] [TV] 수신 | raw_symbol=%s -> symbol=%s | %s | %s | size=%s",
-        raw_symbol, symbol, route, target_side, size
-    )
+    logger.info("[LIVE] [TV] 수신 | raw_symbol=%s -> %s | %s | %s | size=%s",
+                raw_symbol, symbol, route, target_side, size)
 
-    # --- open/close helpers ---
-    def open_by_side(side: str):
-        if side == "BUY":
-            return bg.open_long(symbol, size, order_type)
-        else:
-            return bg.open_short(symbol, size, order_type)
+    # 심볼별 직렬화(동시 신호로 인한 레이스 방지)
+    async with symbol_lock(symbol):
 
-    def close_by_side(side: str):
-        if side == "BUY":
-            # BUY 청산 = close_long
-            return bg.close_long(symbol, size, order_type)
-        else:
-            # SELL 청산 = close_short
-            return bg.close_short(symbol, size, order_type)
-
-    try:
-        # 3) 단순 오픈
+        # 단순 오픈
         if route == "order.open":
-            res = open_by_side(target_side)
+            res = bg.open_long(symbol, size, order_type) if target_side == "BUY" \
+                else bg.open_short(symbol, size, order_type)
             return {"ok": True, "result": res}
 
-        # 4) EA 스타일 리버스 (포지션 없으면 청산 건너뛰고 신규 오픈)
-        elif route == "order.reverse":
-            def try_close_then_open(close_func, open_func, log_label: str):
-                logger.info("[LIVE] reverse: EA | %s | size=%s", log_label, size)
+        # 안전한 리버스
+        if route == "order.reverse":
+            try:
+                # 1) 반대 레그 전량 청산 확인
+                if target_side == "BUY":
+                    close_res = await ensure_close_full(symbol, "SHORT")  # 숏 전량 닫기
+                    if not close_res.get("ok"):
+                        logger.error("reverse abort: could not close SHORT: %s", close_res)
+                        return JSONResponse({"ok": False, "error": "close-failed", "detail": close_res}, status_code=500)
+                    # 2) 신규 진입
+                    open_res = bg.open_long(symbol, size, order_type)
+                elif target_side == "SELL":
+                    close_res = await ensure_close_full(symbol, "LONG")   # 롱 전량 닫기
+                    if not close_res.get("ok"):
+                        logger.error("reverse abort: could not close LONG: %s", close_res)
+                        return JSONResponse({"ok": False, "error": "close-failed", "detail": close_res}, status_code=500)
+                    open_res = bg.open_short(symbol, size, order_type)
+                else:
+                    return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
 
-                close_res = None
-                # (1) 청산은 best-effort: 실패해도 계속 진행
-                try:
-                    close_res = close_func(symbol, size, order_type)
-                except requests.HTTPError as e:
-                    try:
-                        detail = e.response.json()
-                    except Exception:
-                        detail = {"raw": getattr(e.response, "text", "")}
-                    logger.info("EA close skipped (no position or rejected): %s", detail)
-                    close_res = {"skipped": True, "detail": detail}
-
-                # (2) 신규 진입은 반드시 실행
-                open_res = open_func(symbol, size, order_type)
                 return {"ok": True, "closed": close_res, "opened": open_res}
 
-            if target_side == "BUY":
-                return try_close_then_open(bg.close_short, bg.open_long, "close_short -> open_long")
-            elif target_side == "SELL":
-                return try_close_then_open(bg.close_long, bg.open_short, "close_long -> open_short")
-            else:
-                return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
+            except requests.HTTPError as e:
+                try:
+                    detail = e.response.json()
+                except Exception:
+                    detail = {"raw": getattr(e.response, "text", "")}
+                logger.error("HTTPError during reverse: %s", detail)
+                return JSONResponse(
+                    {"ok": False, "error": "bitget-http", "status": getattr(e.response, "status_code", None), "detail": detail},
+                    status_code=500,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Exception in /tv reverse: %r", e)
+                return JSONResponse({"ok": False, "error": "exception", "detail": str(e)}, status_code=500)
 
-        else:
-            return JSONResponse({"ok": False, "error": "unsupported-route"}, status_code=400)
-
-    except requests.HTTPError as e:
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = {"raw": getattr(e.response, "text", "")}
-        logger.error("HTTPError during %s: %s", route, detail)
-        return JSONResponse(
-            {"ok": False, "error": "bitget-http", "status": getattr(e.response, "status_code", None), "detail": detail},
-            status_code=500,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Exception in /tv (EA): %r", e)
-        return JSONResponse({"ok": False, "error": "exception", "detail": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "error": "unsupported-route"}, status_code=400)

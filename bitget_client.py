@@ -17,10 +17,9 @@ class BitgetClient:
     """
     Bitget Mix (UMCBL) REST client (sign-type=2, HMAC).
 
-    변경점 요약
-    - 처음부터 hedge 키워드(open_long/close_short/…)로 전송 (side mismatch 에러 감소)
-    - 22002(닫을 포지션 없음), 400172(side mismatch)는 INFO 레벨 로깅
-    - EA 편의 메서드(open_long/close_short 등) 제공
+    - hedge-first 전송(서버에서 사용)
+    - 22002/400172는 INFO 레벨 로깅
+    - get_hedge_sizes(): 현재 롱/숏 수량 동시 조회
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -56,10 +55,6 @@ class BitgetClient:
         return str(int(time.time() * 1000))
 
     def _sign(self, ts: str, method: str, path_with_query: str, body: str) -> str:
-        """
-        sign-type=2 signature:
-        base64( HMAC_SHA256(secret, ts + UPPER(method) + path_with_query + body) )
-        """
         msg = (ts + method.upper() + path_with_query + body).encode("utf-8")
         digest = hmac.new(self.api_secret.encode("utf-8"), msg, hashlib.sha256).digest()
         return base64.b64encode(digest).decode("utf-8")
@@ -71,27 +66,23 @@ class BitgetClient:
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        쿼리 문자열의 '순서'까지 서명에 포함되므로,
-        서명에 사용한 query 를 실제 요청 URL에도 '그대로' 사용한다.
-        """
         m = method.upper()
         url = self.BASE_URL + path
         ts = self._timestamp_ms()
 
-        # 1) 정렬된 쿼리 문자열 생성 (order 고정)
+        # query (ordered)
         query = ""
         if m == "GET" and params:
             ordered: List[Tuple[str, Any]] = [(k, params[k]) for k in sorted(params.keys())]
             query = "?" + urlencode(ordered)
-            url = url + query  # 실제 요청 URL에도 동일 문자열 사용
+            url = url + query
 
-        # 2) body 직렬화
+        # body
         raw_body = ""
         if m != "GET" and body:
             raw_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        # 3) 서명
+        # sign
         sign = self._sign(ts, m, path + query, raw_body)
 
         headers = {
@@ -103,7 +94,6 @@ class BitgetClient:
             "Content-Type": "application/json",
         }
 
-        # 4) 요청 (params 사용하지 않음: 순서가 깨질 수 있음)
         resp = self.session.request(
             method=m,
             url=url,
@@ -116,76 +106,48 @@ class BitgetClient:
         if 200 <= resp.status_code < 300:
             return resp.json()
 
-        # ---- 비정상 응답 로깅: 예상되는 코드(22002, 400172)는 INFO로 낮춤 ----
-        log_level = "error"
-        payload_for_log: Any
+        # known soft errors -> info
+        level = "error"
+        payload: Any
         try:
-            payload_for_log = resp.json()
-            code = str(payload_for_log.get("code"))
+            payload = resp.json()
+            code = str(payload.get("code"))
             if code in {"22002", "400172"}:
-                # 22002: No position to close (청산할 포지션 없음)
-                # 400172: side mismatch (우리가 거의 안 맞게 보냄 / 또는 1차 시도에서만 관찰)
-                log_level = "info"
+                level = "info"
         except Exception:
-            payload_for_log = {"raw": resp.text}
+            payload = {"raw": resp.text}
 
-        log_fn = self.log.info if log_level == "info" else self.log.error
-        log_fn(
-            "Bitget HTTP %s %s -> %s | url=%s | body=%s",
-            m, path, resp.status_code, resp.url, raw_body if raw_body else ""
-        )
-        log_fn("Bitget response: %s", payload_for_log)
+        log_fn = self.log.info if level == "info" else self.log.error
+        log_fn("Bitget HTTP %s %s -> %s | url=%s | body=%s", m, path, resp.status_code, resp.url, raw_body or "")
+        log_fn("Bitget response: %s", payload)
 
-        # 그대로 예외 전파(상위에서 best-effort 처리)
         resp.raise_for_status()
-        return {}  # never
+        return {}
 
-    # ---------------- position helper ---------------- #
+    # ---------------- positions ---------------- #
 
-    def get_net_position(self, symbol: str) -> Dict[str, float]:
+    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
         """
-        {'net': float} 반환 (one-way 기준: longQty - shortQty)
-        1) singlePosition(symbol, marginCoin) 시도
-        2) 실패 시 allPosition(productType) 폴백
+        현재 심볼의 롱/숏 총 수량 조회 (hedge 모드 기준).
+        return {"long": float, "short": float}
         """
-        # primary
         path = "/api/mix/v1/position/singlePosition"
         params = {"symbol": symbol, "marginCoin": self.margin_coin}
-        try:
-            res = self._request("GET", path, params=params)
-            data = res.get("data") or {}
-            total = data.get("total", {}) or {}
-            long_qty = float(total.get("longTotalSize", 0) or 0)
-            short_qty = float(total.get("shortTotalSize", 0) or 0)
-            net = long_qty - short_qty
-            return {"net": net}
-        except requests.HTTPError:
-            # fallback
-            path2 = "/api/mix/v1/position/allPosition"
-            params2 = {"productType": self.product_type}
-            res2 = self._request("GET", path2, params=params2)
-            net = 0.0
-            for item in (res2.get("data") or []):
-                if item.get("symbol") == symbol:
-                    long_qty = float(item.get("longTotalSize", 0) or 0)
-                    short_qty = float(item.get("shortTotalSize", 0) or 0)
-                    net = long_qty - short_qty
-                    break
-            return {"net": net}
+        res = self._request("GET", path, params=params)
+        data = res.get("data") or {}
+        total = data.get("total", {}) or {}
+        long_qty = float(total.get("longTotalSize", 0) or 0)
+        short_qty = float(total.get("shortTotalSize", 0) or 0)
+        return {"long": long_qty, "short": short_qty}
 
     # ---- hedge helpers ----
     @staticmethod
     def _map_side_for_hedge(logical_side: str, reduce_only: bool) -> str:
-        """
-        buy/sell (+ reduce_only) -> hedge keyword 변환
-        """
         s = logical_side.lower()
         if not reduce_only:
             return "open_long" if s == "buy" else "open_short"
-        # reduce_only=True: 반대 레그 청산
         return "close_short" if s == "buy" else "close_long"
 
-    # core sender used by place_order (with side override)
     def _send_place_order(
         self,
         *,
@@ -203,7 +165,7 @@ class BitgetClient:
             "symbol": tv_symbol,
             "marginCoin": self.margin_coin,
             "productType": self.product_type,
-            "side": side,  # buy/sell 또는 hedge keyword
+            "side": side,
             "orderType": order_type.lower(),
             "size": str(size),
             "reduceOnly": bool(reduce_only),
@@ -220,7 +182,7 @@ class BitgetClient:
         self,
         *,
         tv_symbol: str,
-        side: str,               # logical: "buy" | "sell"
+        side: str,               # "buy" | "sell"
         order_type: str,         # "market" | "limit"
         size: str,
         reduce_only: bool = False,
@@ -228,53 +190,32 @@ class BitgetClient:
         price: Optional[str] = None,
         time_in_force: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        hedge-first 전송:
-          - 1차: hedge 키워드로 보냄 (open_long/close_short 등)
-          - 실패 시 예외 → 필요하면 후속 처리(서버 쪽 best-effort) 또는 buy/sell로 폴백 가능
-        """
-        # 1) 처음부터 hedge 키워드로 변환해서 보냄
         side_first = self._map_side_for_hedge(side, reduce_only)
-        try:
-            return self._send_place_order(
-                tv_symbol=tv_symbol,
-                side=side_first,
-                order_type=order_type,
-                size=size,
-                reduce_only=reduce_only,
-                client_oid=client_oid,
-                price=price,
-                time_in_force=time_in_force,
-            )
-        except requests.HTTPError:
-            # 원한다면 여기에서 buy/sell로 폴백 시도 가능
-            # (현재는 서버 레벨에서 best-effort가 있으므로 재시도 생략)
-            raise
+        return self._send_place_order(
+            tv_symbol=tv_symbol,
+            side=side_first,
+            order_type=order_type,
+            size=size,
+            reduce_only=reduce_only,
+            client_oid=client_oid,
+            price=price,
+            time_in_force=time_in_force,
+        )
 
-    # -------- EA 편의 메서드 -------- #
+    # -------- EA helpers -------- #
 
     def open_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(
-            tv_symbol=symbol, side="buy", order_type=order_type, size=size,
-            reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open"
-        )
+        return self.place_order(tv_symbol=symbol, side="buy",  order_type=order_type, size=size,
+                                reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open-l")
 
     def open_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(
-            tv_symbol=symbol, side="sell", order_type=order_type, size=size,
-            reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open"
-        )
+        return self.place_order(tv_symbol=symbol, side="sell", order_type=order_type, size=size,
+                                reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open-s")
 
     def close_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        # long 청산 = sell + reduceOnly
-        return self.place_order(
-            tv_symbol=symbol, side="sell", order_type=order_type, size=size,
-            reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
-        )
+        return self.place_order(tv_symbol=symbol, side="sell", order_type=order_type, size=size,
+                                reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close-l")
 
     def close_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        # short 청산 = buy + reduceOnly
-        return self.place_order(
-            tv_symbol=symbol, side="buy", order_type=order_type, size=size,
-            reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
-        )
+        return self.place_order(tv_symbol=symbol, side="buy",  order_type=order_type, size=size,
+                                reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close-s")
