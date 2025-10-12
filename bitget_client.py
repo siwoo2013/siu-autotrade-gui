@@ -20,7 +20,10 @@ class BitgetClient:
 
     - product_type: "umcbl" (USDT-M perpetual)
     - margin_coin : "USDT"
-    - One-way position mode: side = "buy" | "sell"
+    - One-way logic input: side = "buy" | "sell"
+      * If Bitget account is actually HEDGE mode, we auto-map:
+        - reduce_only=False: buy -> open_long,  sell -> open_short
+        - reduce_only=True : buy -> close_short, sell -> close_long
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -164,23 +167,31 @@ class BitgetClient:
                     break
             return {"net": net}
 
-    def place_order(
+    # ---- hedge helpers ----
+    @staticmethod
+    def _map_side_for_hedge(logical_side: str, reduce_only: bool) -> str:
+        """
+        Convert logical side (buy/sell + reduce_only) to hedge side string.
+        """
+        s = logical_side.lower()
+        if not reduce_only:
+            return "open_long" if s == "buy" else "open_short"
+        # reduce_only=True: reduce opposite leg
+        return "close_short" if s == "buy" else "close_long"
+
+    # core sender used by place_order (with optional override side)
+    def _send_place_order(
         self,
         *,
         tv_symbol: str,
-        side: str,               # "buy" | "sell" (one-way)
-        order_type: str,         # "market" | "limit"
+        side: str,
+        order_type: str,
         size: str,
-        reduce_only: bool = False,
-        client_oid: Optional[str] = None,
-        price: Optional[str] = None,          # for limit
-        time_in_force: Optional[str] = None,  # "normal"|"post_only"|"fok"|"ioc" (if supported)
+        reduce_only: bool,
+        client_oid: Optional[str],
+        price: Optional[str],
+        time_in_force: Optional[str],
     ) -> Dict[str, Any]:
-        """
-        Place order on Bitget Mix (UMCBL).
-        - For one-way: use side="buy"/"sell".
-        - reduce_only=True for position reduction (close).
-        """
         path = "/api/mix/v1/order/placeOrder"
         body: Dict[str, Any] = {
             "symbol": tv_symbol,
@@ -197,5 +208,58 @@ class BitgetClient:
             body["price"] = str(price)
         if time_in_force:
             body["timeInForceValue"] = time_in_force
-
         return self._request("POST", path, body=body)
+
+    def place_order(
+        self,
+        *,
+        tv_symbol: str,
+        side: str,               # logical: "buy" | "sell"
+        order_type: str,         # "market" | "limit"
+        size: str,
+        reduce_only: bool = False,
+        client_oid: Optional[str] = None,
+        price: Optional[str] = None,          # for limit
+        time_in_force: Optional[str] = None,  # "normal"|"post_only"|"fok"|"ioc"
+    ) -> Dict[str, Any]:
+        """
+        Place order. If Bitget returns side-mismatch(400172), retry once with hedge side mapping.
+        """
+        try:
+            # 1) try logical one-way keywords ("buy"/"sell")
+            return self._send_place_order(
+                tv_symbol=tv_symbol,
+                side=side,
+                order_type=order_type,
+                size=size,
+                reduce_only=reduce_only,
+                client_oid=client_oid,
+                price=price,
+                time_in_force=time_in_force,
+            )
+        except requests.HTTPError as e:
+            # inspect response json
+            try:
+                j = e.response.json()
+            except Exception:
+                j = {}
+            code = str(j.get("code", ""))
+            msg = str(j.get("msg", "")).lower()
+
+            if code == "400172" or "side mismatch" in msg:
+                # 2) retry with hedge side mapping
+                hedge_side = self._map_side_for_hedge(side, reduce_only)
+                self.log.warning("Retrying with hedge side mapping: %s -> %s (reduceOnly=%s)",
+                                 side, hedge_side, reduce_only)
+                return self._send_place_order(
+                    tv_symbol=tv_symbol,
+                    side=hedge_side,
+                    order_type=order_type,
+                    size=size,
+                    reduce_only=reduce_only,    # Bitget ignores reduceOnly in hedge but keep for parity
+                    client_oid=(client_oid + "-h") if client_oid else None,
+                    price=price,
+                    time_in_force=time_in_force,
+                )
+            # not side-mismatch → bubble up
+            raise
