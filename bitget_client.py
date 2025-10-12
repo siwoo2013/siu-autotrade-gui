@@ -19,8 +19,8 @@ class BitgetClient:
     Bitget Mix (UMCBL) REST client (sign-type=2).
 
     입력은 항상 one-way 논리(side="buy"/"sell")로 받되,
-    첫 4xx(HTTPError) 발생 시 조건 없이 hedge 포맷(open_long/open_short/close_long/close_short)으로
-    1회 자동 재시도하는 핫픽스가 적용되어 있음.
+    첫 실패(HTTP 4xx 등) 시 조건 없이 hedge 포맷(open_long/open_short/close_long/close_short)으로
+    1회 자동 재시도하는 핫픽스 적용.
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -220,10 +220,10 @@ class BitgetClient:
     ) -> Dict[str, Any]:
         """
         1차: one-way 'buy'/'sell' 시도
-        2차(핫픽스): 첫 4xx가 발생하면 조건 없이 hedge 키워드로 1회 재시도
+        2차(핫픽스): 첫 실패(예외 발생) 시 조건 없이 hedge 키워드로 1회 재시도
         """
+        # 1) one-way 시도
         try:
-            # 1) one-way 시도
             return self._send_place_order(
                 tv_symbol=tv_symbol,
                 side=side,
@@ -234,8 +234,8 @@ class BitgetClient:
                 price=price,
                 time_in_force=time_in_force,
             )
+        # 2) HTTP 에러 → 강제 헤지 재시도
         except requests.HTTPError as e:
-            # ---- 🔥 HOTFIX: 첫 4xx면 무조건 hedge 포맷으로 1회 재시도 ----
             status = getattr(getattr(e, "response", None), "status_code", None)
             code = None
             msg = ""
@@ -245,19 +245,30 @@ class BitgetClient:
                 msg = str(j.get("msg", "")).lower()
             except Exception:
                 pass
-
-            # 재시도 로그 (INFO로 남겨 Live Tail에서 확실히 보이게)
             self.log.info("fallback trigger: status=%s code=%s msg=%s", status, code, msg)
-
             hedge_side = self._map_side_for_hedge(side, reduce_only)
             self.log.info("Retrying with hedge side: %s -> %s (reduceOnly=%s)", side, hedge_side, reduce_only)
-
             return self._send_place_order(
                 tv_symbol=tv_symbol,
                 side=hedge_side,
                 order_type=order_type,
                 size=size,
-                reduce_only=reduce_only,    # Bitget에서 무시될 수 있으나 유지
+                reduce_only=reduce_only,
+                client_oid=(client_oid + "-h") if client_oid else None,
+                price=price,
+                time_in_force=time_in_force,
+            )
+        # 3) 그 외 모든 예외도 동일하게 1회 재시도 (예외타입 차이 방지)
+        except Exception as e:  # noqa: BLE001
+            self.log.info("fallback trigger: non-HTTP exception=%r", e)
+            hedge_side = self._map_side_for_hedge(side, reduce_only)
+            self.log.info("Retrying with hedge side: %s -> %s (reduceOnly=%s)", side, hedge_side, reduce_only)
+            return self._send_place_order(
+                tv_symbol=tv_symbol,
+                side=hedge_side,
+                order_type=order_type,
+                size=size,
+                reduce_only=reduce_only,
                 client_oid=(client_oid + "-h") if client_oid else None,
                 price=price,
                 time_in_force=time_in_force,
