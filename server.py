@@ -45,8 +45,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-strong-secret").strip()
 
 logger = logging.getLogger(APP_NAME)
 handler = logging.StreamHandler()
-handler.setFormatter(
-    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
@@ -172,9 +171,9 @@ async def tv_webhook(request: Request) -> Response:
     try:
         # 1) 우선 정방향으로 오픈 시도
         _bg.place_order(
-            symbol=symbol,
-            side=side_open,               # "buy"/"sell"
-            order_type=ord_type.lower(),  # "market"
+            tv_symbol=symbol,            # <- 파라미터명 tv_symbol 로 통일
+            side=side_open,              # "buy"/"sell"
+            order_type=ord_type.lower(), # "market"
             size=size,
             reduce_only=False,
             client_oid=client_oid,
@@ -193,7 +192,7 @@ async def tv_webhook(request: Request) -> Response:
         try:
             logger.info("side mismatch on OPEN -> force CLOSE first: %s (size=%s)", opposite_side, size)
             _bg.place_order(
-                symbol=symbol,
+                tv_symbol=symbol,
                 side=opposite_side,
                 order_type=ord_type.lower(),
                 size=size,
@@ -201,14 +200,12 @@ async def tv_webhook(request: Request) -> Response:
                 client_oid=f"{client_oid}-close",
             )
         except Exception as e_close:
-            logger.error(
-                "force close failed (continue to OPEN): %s", str(e_close)
-            )
+            logger.error("force close failed (continue to OPEN): %s", str(e_close))
 
         # 3) close 이후 다시 오픈 시도
         try:
             _bg.place_order(
-                symbol=symbol,
+                tv_symbol=symbol,
                 side=side_open,
                 order_type=ord_type.lower(),
                 size=size,
