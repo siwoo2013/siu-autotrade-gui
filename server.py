@@ -51,12 +51,18 @@ _bg = BitgetClient(
 
 def normalize_symbol(tv_symbol: str) -> str:
     s = tv_symbol.upper().strip()
-    s = re.sub(r"\.P$", "", s)                 # .P 제거
-    s = re.sub(r"PERP(ETUAL)?$", "", s)        # PERP/ PERPETUAL 제거
+    s = re.sub(r"\.P$", "", s)                  # .P 제거
+    s = re.sub(r"PERP(ETUAL)?$", "", s)         # PERP/ PERPETUAL 제거
     s = s.replace(":", "")
-    s = re.sub(r"[^A-Z0-9]", "", s)
+    # 밑줄(_)은 유지해야 Bitget 심볼 형식 보존됨
+    s = re.sub(r"[^A-Z0-9_]", "", s)
+
+    # 중복 방지: 이미 _UMCBL로 끝나면 그대로, 아니면 한 번만 붙이기
     if not s.endswith("_UMCBL"):
-        s = f"{s}_UMCBL"
+        # 혹시 '...UMCBL'로 끝나는데 밑줄만 빠진 경우 대비
+        s = re.sub(r"UMCBL$", "_UMCBL", s)
+        if not s.endswith("_UMCBL"):
+            s = f"{s}_UMCBL"
     return s
 
 def side_open_for_oneway(target_side: str) -> str:
