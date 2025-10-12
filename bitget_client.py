@@ -17,9 +17,10 @@ class BitgetClient:
     """
     Bitget Mix (UMCBL) REST client (sign-type=2, HMAC).
 
-    - 기본 입력은 one-way 논리(side="buy"/"sell")로 받는다.
-    - 첫 실패(HTTP 4xx 또는 기타 예외) 시 hedge 포맷(open_long/open_short/close_long/close_short)으로 1회 재시도 (핫픽스).
-    - EA 편의 메서드 제공: open_long / open_short / close_long / close_short
+    변경점 요약
+    - 처음부터 hedge 키워드(open_long/close_short/…)로 전송 (side mismatch 에러 감소)
+    - 22002(닫을 포지션 없음), 400172(side mismatch)는 INFO 레벨 로깅
+    - EA 편의 메서드(open_long/close_short 등) 제공
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -112,19 +113,32 @@ class BitgetClient:
             timeout=self.timeout,
         )
 
-        if not (200 <= resp.status_code < 300):
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = {"raw": resp.text}
-            self.log.error(
-                "Bitget HTTP %s %s -> %s | url=%s | body=%s",
-                m, path, resp.status_code, resp.url, raw_body if raw_body else ""
-            )
-            self.log.error("Bitget response: %s", detail)
-            resp.raise_for_status()
+        if 200 <= resp.status_code < 300:
+            return resp.json()
 
-        return resp.json()
+        # ---- 비정상 응답 로깅: 예상되는 코드(22002, 400172)는 INFO로 낮춤 ----
+        log_level = "error"
+        payload_for_log: Any
+        try:
+            payload_for_log = resp.json()
+            code = str(payload_for_log.get("code"))
+            if code in {"22002", "400172"}:
+                # 22002: No position to close (청산할 포지션 없음)
+                # 400172: side mismatch (우리가 거의 안 맞게 보냄 / 또는 1차 시도에서만 관찰)
+                log_level = "info"
+        except Exception:
+            payload_for_log = {"raw": resp.text}
+
+        log_fn = self.log.info if log_level == "info" else self.log.error
+        log_fn(
+            "Bitget HTTP %s %s -> %s | url=%s | body=%s",
+            m, path, resp.status_code, resp.url, raw_body if raw_body else ""
+        )
+        log_fn("Bitget response: %s", payload_for_log)
+
+        # 그대로 예외 전파(상위에서 best-effort 처리)
+        resp.raise_for_status()
+        return {}  # never
 
     # ---------------- position helper ---------------- #
 
@@ -189,7 +203,7 @@ class BitgetClient:
             "symbol": tv_symbol,
             "marginCoin": self.margin_coin,
             "productType": self.product_type,
-            "side": side,                            # buy/sell 또는 hedge keyword
+            "side": side,  # buy/sell 또는 hedge keyword
             "orderType": order_type.lower(),
             "size": str(size),
             "reduceOnly": bool(reduce_only),
@@ -215,13 +229,16 @@ class BitgetClient:
         time_in_force: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        1차: one-way 'buy'/'sell' 시도
-        2차(핫픽스): 첫 실패(예외 발생) 시 조건 없이 hedge 키워드로 1회 재시도
+        hedge-first 전송:
+          - 1차: hedge 키워드로 보냄 (open_long/close_short 등)
+          - 실패 시 예외 → 필요하면 후속 처리(서버 쪽 best-effort) 또는 buy/sell로 폴백 가능
         """
+        # 1) 처음부터 hedge 키워드로 변환해서 보냄
+        side_first = self._map_side_for_hedge(side, reduce_only)
         try:
             return self._send_place_order(
                 tv_symbol=tv_symbol,
-                side=side,
+                side=side_first,
                 order_type=order_type,
                 size=size,
                 reduce_only=reduce_only,
@@ -229,43 +246,10 @@ class BitgetClient:
                 price=price,
                 time_in_force=time_in_force,
             )
-        except requests.HTTPError as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            code = None
-            msg = ""
-            try:
-                j = e.response.json()
-                code = str(j.get("code"))
-                msg = str(j.get("msg", "")).lower()
-            except Exception:
-                pass
-            self.log.info("fallback trigger: status=%s code=%s msg=%s", status, code, msg)
-            hedge_side = self._map_side_for_hedge(side, reduce_only)
-            self.log.info("Retrying with hedge side: %s -> %s (reduceOnly=%s)", side, hedge_side, reduce_only)
-            return self._send_place_order(
-                tv_symbol=tv_symbol,
-                side=hedge_side,
-                order_type=order_type,
-                size=size,
-                reduce_only=reduce_only,
-                client_oid=(client_oid + "-h") if client_oid else None,
-                price=price,
-                time_in_force=time_in_force,
-            )
-        except Exception as e:  # noqa: BLE001
-            self.log.info("fallback trigger: non-HTTP exception=%r", e)
-            hedge_side = self._map_side_for_hedge(side, reduce_only)
-            self.log.info("Retrying with hedge side: %s -> %s (reduceOnly=%s)", side, hedge_side, reduce_only)
-            return self._send_place_order(
-                tv_symbol=tv_symbol,
-                side=hedge_side,
-                order_type=order_type,
-                size=size,
-                reduce_only=reduce_only,
-                client_oid=(client_oid + "-h") if client_oid else None,
-                price=price,
-                time_in_force=time_in_force,
-            )
+        except requests.HTTPError:
+            # 원한다면 여기에서 buy/sell로 폴백 시도 가능
+            # (현재는 서버 레벨에서 best-effort가 있으므로 재시도 생략)
+            raise
 
     # -------- EA 편의 메서드 -------- #
 
