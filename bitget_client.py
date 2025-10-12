@@ -1,119 +1,175 @@
+# bitget_client.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
-import os
-from pathlib import Path
-from typing import Any, Dict
+import time
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import requests
 
-from bitget_client import BitgetClient
 
-# ----------------------------- Env & mode -----------------------------
-APP_NAME = "siu-autotrade-gui"
-BASE_DIR = Path(__file__).resolve().parent
-
-TRADE_MODE = os.getenv("TRADE_MODE", "demo").lower()  # live | demo
-if os.getenv("DEMO") is not None:
-    DEMO = os.getenv("DEMO", "false").lower() in ["1", "true", "yes", "on"]
-else:
-    DEMO = (TRADE_MODE != "live")
-
-MODE_TAG = "[DEMO]" if DEMO else "[LIVE]"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-strong-secret")
-
-# Bitget keys
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "umcbl").lower()  # one-way USDT-M
-
-# ----------------------------- FastAPI -----------------------------
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-app = FastAPI(title=APP_NAME)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_headers=["*"],
-    allow_methods=["*"],
-)
-
-# ----------------------------- Bitget client -----------------------------
-_bg = BitgetClient(
-    api_key=BITGET_API_KEY,
-    api_secret=BITGET_API_SECRET,
-    passphrase=BITGET_PASSPHRASE,
-    product_type=PRODUCT_TYPE,
-)
-
-# ----------------------------- helpers -----------------------------
-def tv_symbol_to_bitget(sym: str) -> str:
+class BitgetClient:
     """
-    TV 심볼을 Bitget 심볼로 정규화:
-    - 예) "BTCUSDT.P" -> "BTCUSDT_UMCBL"
-    - 이미 *_UMCBL 형태면 그대로 사용
+    Minimal Bitget Mix (UMCBL) REST client (sign-type=2).
+
+    - product_type: "umcbl" (USDT-M futures)
+    - margin_coin : "USDT"
+    - one-way position mode: use side = "buy" / "sell"
     """
-    s = (sym or "").upper().strip()
-    if s.endswith("_UMCBL") or s.endswith("_DMCBL"):
-        return s
-    base = s.replace(".P", "").replace(".UMCBL", "").replace("_UMCBL", "")
-    return f"{base}_UMCBL"
 
-def ok(data: Dict[str, Any]) -> JSONResponse:
-    return JSONResponse(data)
+    BASE_URL = "https://api.bitget.com"
+    SIGN_TYPE = "2"  # HMAC-SHA256 + base64
 
-def fail(msg: str, status: int = 500) -> JSONResponse:
-    return JSONResponse({"ok": False, "error": msg}, status_code=status)
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        passphrase: str,
+        *,
+        product_type: str = "umcbl",
+        margin_coin: str = "USDT",
+        timeout: int = 10,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self.product_type = product_type
+        self.margin_coin = margin_coin
+        self.timeout = timeout
 
-# ----------------------------- routes -----------------------------
-@app.get("/")
-def health() -> JSONResponse:
-    return ok({"ok": True, "service": APP_NAME, "mode": "live" if not DEMO else "demo"})
+        self.session = requests.Session()
+        self.log = logger or logging.getLogger("bitget")
 
-@app.post("/tv")
-async def tv_webhook(req: Request) -> JSONResponse:
-    try:
-        payload = await req.json()
-    except Exception:
-        return fail("invalid json", 400)
+        # sanity
+        if not all([self.api_key, self.api_secret, self.passphrase]):
+            raise ValueError("Bitget keys missing")
 
-    # 1) 시크릿 체크
-    if (payload or {}).get("secret") != WEBHOOK_SECRET:
-        return fail("unauthorized", 401)
+    # ---------------- internal helpers ---------------- #
 
-    route = (payload.get("route") or "").lower().strip()          # "order.reverse" 등
-    exchange = (payload.get("exchange") or "").lower().strip()    # "bitget"
-    tv_sym = str(payload.get("symbol") or "")
-    side = (payload.get("target_side") or "buy").lower().strip()  # "buy" | "sell"
-    order_type = (payload.get("type") or "market").lower().strip()
-    size = float(payload.get("size") or 0.0)
-    client_oid = payload.get("client_oid")
+    def _timestamp_ms(self) -> str:
+        return str(int(time.time() * 1000))
 
-    log.info("%s [TV] 수신 | %s | %s | %s | size=%.6f",
-             MODE_TAG, tv_sym, route, side.upper(), size)
+    def _sign(self, ts: str, method: str, path: str, body: str) -> str:
+        """sign-type=2 signature (base64(hmac_sha256(secret, ts+method+path+body)))"""
+        message = (ts + method.upper() + path + body).encode("utf-8")
+        digest = hmac.new(self.api_secret.encode("utf-8"), message, hashlib.sha256).digest()
+        return base64.b64encode(digest).decode("utf-8")
 
-    if exchange != "bitget":
-        return fail("unsupported exchange", 400)
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        url = self.BASE_URL + path
+        ts = self._timestamp_ms()
 
-    symbol = tv_symbol_to_bitget(tv_sym)
+        # for signature: params serialized into path query (GET)
+        query = ""
+        if method.upper() == "GET" and params:
+            # Bitget signs only the requestPath (with query string)
+            items = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+            query = "?" + items
 
-    # 2) 단순 주문 실행 (One-way 기준: reduceOnly는 TV 메시지에 없으면 False)
-    try:
-        res = _bg.place_order(
-            symbol=symbol,
-            side=("buy" if side == "buy" else "sell"),
-            order_type=("market" if order_type == "market" else "limit"),
-            size=size,
-            reduce_only=bool(payload.get("reduce_only", False)),
-            client_oid=(client_oid or None),
+        raw_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
+        sign = self._sign(ts, method, path + query, raw_body)
+
+        headers = {
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "ACCESS-SIGN-TYPE": self.SIGN_TYPE,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-SIGN": sign,
+            "Content-Type": "application/json",
+        }
+
+        resp = self.session.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            params=params if method.upper() == "GET" else None,
+            data=raw_body if method.upper() != "GET" else None,
+            timeout=self.timeout,
         )
-        return ok({"ok": True, "symbol": symbol, "result": res})
-    except Exception as e:
-        log.exception("Exception in /tv")
-        return fail(str(e), 500)
+
+        # log non-2xx
+        if not (200 <= resp.status_code < 300):
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = {"raw": resp.text}
+            self.log.error(
+                "Bitget HTTP %s %s -> %s | url=%s | body=%s",
+                method.upper(),
+                path,
+                resp.status_code,
+                resp.url,
+                raw_body if raw_body else "",
+            )
+            self.log.error("Bitget response: %s", detail)
+            resp.raise_for_status()
+
+        data = resp.json()
+        return data
+
+    # ---------------- public APIs ---------------- #
+
+    def get_net_position(self, symbol: str) -> Dict[str, float]:
+        """
+        Return {'net': float}  (one-way 기준: longQty - shortQty)
+        """
+        path = "/api/mix/v1/position/singlePosition"
+        params = {
+            "symbol": symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
+        }
+        res = self._request("GET", path, params=params)
+        # Bitget success: {"code":"00000","msg":"success","data":{...}} or {"data":[]}
+        net = 0.0
+        try:
+            d = res.get("data") or {}
+            # one-way mode에서는 holdSide가 "long"/"short"가 아니라 "net"만 올 수 있음
+            if isinstance(d, dict):
+                long_qty = float(d.get("total", {}).get("longTotalSize", "0") or "0")
+                short_qty = float(d.get("total", {}).get("shortTotalSize", "0") or "0")
+                net = long_qty - short_qty
+        except Exception:
+            pass
+        return {"net": net}
+
+    def place_order(
+        self,
+        *,
+        tv_symbol: str,
+        side: str,               # "buy" | "sell" (one-way)
+        order_type: str,         # "market" | "limit"
+        size: str,
+        reduce_only: bool = False,
+        client_oid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        One-way 모드: side = "buy" / "sell"
+        reduce_only=True 는 강제 청산용
+        """
+        path = "/api/mix/v1/order/placeOrder"
+        body = {
+            "symbol": tv_symbol,
+            "marginCoin": self.margin_coin,
+            "productType": self.product_type,
+            "side": side,                   # one-way
+            "orderType": order_type,
+            "size": str(size),
+            "reduceOnly": bool(reduce_only),
+        }
+        if client_oid:
+            body["clientOid"] = client_oid
+
+        return self._request("POST", path, body=body)
