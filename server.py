@@ -29,7 +29,7 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY", "").strip()
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "").strip()
 
-PRODUCT_TYPE = "umcbl"  # U-margined perpetual
+PRODUCT_TYPE = "umcbl"  # U-margined perpetual (Bitget expects lowercase here)
 
 app = FastAPI(title=APP_NAME)
 app.add_middleware(
@@ -47,6 +47,8 @@ _bg = BitgetClient(
     product_type=PRODUCT_TYPE,
 )
 
+# ---------------- helpers ---------------- #
+
 def normalize_symbol(tv_symbol: str) -> str:
     s = tv_symbol.upper().strip()
     s = re.sub(r"\.P$", "", s)                 # .P 제거
@@ -58,13 +60,23 @@ def normalize_symbol(tv_symbol: str) -> str:
     return s
 
 def side_open_for_oneway(target_side: str) -> str:
-    """BUY/SELL -> buy/sell (오픈용)"""
     t = target_side.upper()
     if t == "BUY":
         return "buy"
     if t == "SELL":
         return "sell"
     raise ValueError("target_side must be BUY or SELL")
+
+def opposite(side_buy_sell: str) -> str:
+    return "sell" if side_buy_sell == "buy" else "buy"
+
+def float_safe(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+# ---------------- routes ---------------- #
 
 @app.get("/")
 def health() -> Dict[str, Any]:
@@ -81,89 +93,138 @@ async def tv_webhook(req: Request):
     if data.get("secret") != WEBHOOK_SECRET:
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-    route = data.get("route", "")
+    route = (data.get("route") or "").strip()
     exchange = (data.get("exchange") or "").lower()
-    tv_symbol = data.get("symbol", "")
-    target_side = (data.get("target_side") or "").upper()
-    ord_type = (data.get("type") or "MARKET").upper()
-    size = float(data.get("size") or 0)
+    tv_symbol = (data.get("symbol") or "").strip()
+    target_side_raw = (data.get("target_side") or "").upper().strip()   # "BUY"/"SELL"
+    ord_type = (data.get("type") or "MARKET").upper().strip()           # "MARKET"|"LIMIT"
+    size = float_safe(data.get("size"), 0.0)
 
     symbol = normalize_symbol(tv_symbol)
-    print(f"{MODE_TAG} [TV] 수신 | {symbol} | {route} | {target_side} | size={size:.6f}")
+    print(f"{MODE_TAG} [TV] 수신 | {symbol} | {route} | {target_side_raw} | size={size:.6f}")
 
     if exchange != "bitget":
         return JSONResponse({"ok": False, "error": "unsupported-exchange"}, status_code=400)
-    if route not in ("order.reverse", "order.open"):
+
+    if route not in ("order.open", "order.reverse"):
         return JSONResponse({"ok": False, "error": "unsupported-route"}, status_code=400)
 
+    if ord_type not in ("MARKET", "LIMIT"):
+        return JSONResponse({"ok": False, "error": "unsupported-ordertype"}, status_code=400)
+
     try:
-        side_open = side_open_for_oneway(target_side)  # buy/sell
+        side_target = side_open_for_oneway(target_side_raw)  # "buy"|"sell"
     except ValueError as ve:
         return JSONResponse({"ok": False, "error": str(ve)}, status_code=400)
 
-    client_oid = f"tv-{int(os.times().elapsed * 1000)}"
+    if size <= 0:
+        return JSONResponse({"ok": False, "error": "invalid-size"}, status_code=400)
 
-    # 1) OPEN 시도
+    client_oid_base = f"tv-{int(os.times().elapsed * 1000)}"
+
+    # 0) 현재 순포지션(net) 확인
     try:
-        _bg.place_order(
-            tv_symbol=symbol,
-            side=side_open,                 # "buy" or "sell"
-            order_type=ord_type.lower(),   # "market"
-            size=size,
-            reduce_only=False,
-            client_oid=client_oid,
-        )
-        return JSONResponse({"ok": True, "action": "open", "side": side_open})
+        pos = _bg.get_net_position(symbol)
+        net = float_safe(pos.get("net"), 0.0)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "position-fetch-failed", "detail": str(e)}, status_code=500)
 
-    except requests.HTTPError as e1:
-        status = getattr(getattr(e1, "response", None), "status_code", None)
+    # net > 0: 순롱 / net < 0: 순숏 / net == 0: 무포지션
+    print(f"{MODE_TAG} net={net} ( {('LONG' if net>0 else 'SHORT' if net<0 else 'FLAT')} )")
+
+    try:
+        # ---------------- order.reverse: 전량 청산 후 반전 진입 ----------------
+        if route == "order.reverse":
+            if net != 0:
+                # 1) 전량 청산
+                close_side = "sell" if net > 0 else "buy"  # 롱이면 sell로 감산, 숏이면 buy로 감산
+                close_qty = abs(net)
+                print(f"{MODE_TAG} reverse: close ALL first | side={close_side} reduceOnly size={close_qty}")
+                if close_qty > 0:
+                    _bg.place_order(
+                        tv_symbol=symbol,
+                        side=close_side,
+                        order_type=ord_type.lower(),
+                        size=str(close_qty),
+                        reduce_only=True,
+                        client_oid=f"{client_oid_base}-rev-close",
+                    )
+
+            # 2) 목표 방향으로 오픈
+            print(f"{MODE_TAG} reverse: open | side={side_target} size={size}")
+            _bg.place_order(
+                tv_symbol=symbol,
+                side=side_target,
+                order_type=ord_type.lower(),
+                size=str(size),
+                reduce_only=False,
+                client_oid=f"{client_oid_base}-rev-open",
+            )
+            return JSONResponse({"ok": True, "action": "reverse", "open_side": side_target})
+
+        # ---------------- order.open: 필요 시 부분감산 후 남는 수량만 오픈 ----------------
+        else:  # order.open
+            if (net > 0 and side_target == "buy") or (net < 0 and side_target == "sell") or (net == 0):
+                # 같은 방향이거나 무포 → 그대로 오픈
+                print(f"{MODE_TAG} open: direct open | side={side_target} size={size}")
+                _bg.place_order(
+                    tv_symbol=symbol,
+                    side=side_target,
+                    order_type=ord_type.lower(),
+                    size=str(size),
+                    reduce_only=False,
+                    client_oid=f"{client_oid_base}-open",
+                )
+                return JSONResponse({"ok": True, "action": "open", "side": side_target})
+
+            # 반대 방향이면 먼저 감산
+            need_reduce = min(abs(net), size)
+            remain_open = max(0.0, size - need_reduce)
+            reduce_side = side_target  # 원웨이: 반대 포지션 감산은 '목표쪽 + reduceOnly=True' 로 보냄
+
+            if need_reduce > 0:
+                print(f"{MODE_TAG} open: reduce first | side={reduce_side} reduceOnly size={need_reduce}")
+                _bg.place_order(
+                    tv_symbol=symbol,
+                    side=reduce_side,
+                    order_type=ord_type.lower(),
+                    size=str(need_reduce),
+                    reduce_only=True,
+                    client_oid=f"{client_oid_base}-open-reduce",
+                )
+
+            if remain_open > 0:
+                print(f"{MODE_TAG} open: then open remain | side={side_target} size={remain_open}")
+                _bg.place_order(
+                    tv_symbol=symbol,
+                    side=side_target,
+                    order_type=ord_type.lower(),
+                    size=str(remain_open),
+                    reduce_only=False,
+                    client_oid=f"{client_oid_base}-open-remain",
+                )
+
+            return JSONResponse({
+                "ok": True,
+                "action": "open-after-reduce",
+                "reduced": need_reduce,
+                "opened": remain_open,
+                "side": side_target
+            })
+
+    except requests.HTTPError as http_err:
+        # Bitget REST 오류 자세히 노출
+        status = getattr(getattr(http_err, "response", None), "status_code", None)
         body_text = ""
         try:
-            body_text = e1.response.text or ""
+            body_text = http_err.response.text or ""
         except Exception:
-            body_text = str(e1)
-
-        # Bitget 원웨이: 강제 close 는 open 과 "같은 방향 + reduceOnly=True" 로 보내야 함
-        if status == 400 and "side mismatch" in body_text:
-            try:
-                print(f"side mismatch on OPEN -> force CLOSE first: {side_open} (reduceOnly, size={size})")
-                _bg.place_order(
-                    tv_symbol=symbol,
-                    side=side_open,                 # ★ open 과 같은 방향
-                    order_type=ord_type.lower(),
-                    size=size,
-                    reduce_only=True,               # ★ reduceOnly 로 강제 청산
-                    client_oid=f"{client_oid}-close",
-                )
-            except Exception as e_close:
-                print(f"force close failed (continue to OPEN): {e_close}")
-
-            # 다시 OPEN
-            try:
-                _bg.place_order(
-                    tv_symbol=symbol,
-                    side=side_open,
-                    order_type=ord_type.lower(),
-                    size=size,
-                    reduce_only=False,
-                    client_oid=f"{client_oid}-open",
-                )
-                return JSONResponse({
-                    "ok": True,
-                    "action": "force-close-then-open",
-                    "open_side": side_open
-                })
-            except Exception as e2:
-                print(f"Exception in /tv (re-open): {e2}")
-                return JSONResponse({"ok": False, "error": "reopen-failed", "detail": str(e2)}, status_code=500)
-
-        # 그 외 에러
-        print(f"Exception in /tv (open): {e1}")
-        return JSONResponse({"ok": False, "error": "open-failed", "detail": str(e1)}, status_code=500)
-
+            body_text = str(http_err)
+        print(f"{MODE_TAG} HTTPError: {status} | {body_text}")
+        return JSONResponse({"ok": False, "error": "bitget-http", "status": status, "detail": body_text}, status_code=500)
     except Exception as e:
-        print(f"Exception in /tv (open/unknown): {e}")
-        return JSONResponse({"ok": False, "error": "open-failed", "detail": str(e)}, status_code=500)
+        print(f"{MODE_TAG} Exception: {e}")
+        return JSONResponse({"ok": False, "error": "exception", "detail": str(e)}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn

@@ -46,7 +46,6 @@ class BitgetClient:
         self.session = requests.Session()
         self.log = logger or logging.getLogger("bitget")
 
-        # sanity
         if not all([self.api_key, self.api_secret, self.passphrase]):
             raise ValueError("Bitget keys missing")
 
@@ -71,10 +70,8 @@ class BitgetClient:
         url = self.BASE_URL + path
         ts = self._timestamp_ms()
 
-        # for signature: params serialized into path query (GET)
         query = ""
         if method.upper() == "GET" and params:
-            # Bitget signs only the requestPath (with query string)
             items = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
             query = "?" + items
 
@@ -99,7 +96,6 @@ class BitgetClient:
             timeout=self.timeout,
         )
 
-        # log non-2xx
         if not (200 <= resp.status_code < 300):
             try:
                 detail = resp.json()
@@ -132,14 +128,13 @@ class BitgetClient:
             "productType": self.product_type,
         }
         res = self._request("GET", path, params=params)
-        # Bitget success: {"code":"00000","msg":"success","data":{...}} or {"data":[]}
         net = 0.0
         try:
             d = res.get("data") or {}
-            # one-way mode에서는 holdSide가 "long"/"short"가 아니라 "net"만 올 수 있음
             if isinstance(d, dict):
-                long_qty = float(d.get("total", {}).get("longTotalSize", "0") or "0")
-                short_qty = float(d.get("total", {}).get("shortTotalSize", "0") or "0")
+                total = d.get("total", {}) or {}
+                long_qty = float(total.get("longTotalSize", "0") or "0")
+                short_qty = float(total.get("shortTotalSize", "0") or "0")
                 net = long_qty - short_qty
         except Exception:
             pass
@@ -157,19 +152,18 @@ class BitgetClient:
     ) -> Dict[str, Any]:
         """
         One-way 모드: side = "buy" / "sell"
-        reduce_only=True 는 강제 청산용
+        reduce_only=True 는 감산(청산) 용
         """
         path = "/api/mix/v1/order/placeOrder"
         body = {
             "symbol": tv_symbol,
             "marginCoin": self.margin_coin,
             "productType": self.product_type,
-            "side": side,                   # one-way
-            "orderType": order_type,
+            "side": side,
+            "orderType": order_type.lower(),
             "size": str(size),
             "reduceOnly": bool(reduce_only),
         }
         if client_oid:
             body["clientOid"] = client_oid
-
         return self._request("POST", path, body=body)
