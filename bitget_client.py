@@ -117,25 +117,42 @@ class BitgetClient:
 
     # ---------------- public APIs ---------------- #
 
-    def get_net_position(self, symbol: str) -> Dict[str, float]:
-        """
-        Return {'net': float}  (one-way 기준: longQty - shortQty)
-        """
-        path = "/api/mix/v1/position/singlePosition"
-        params = {
-            "symbol": symbol,
-            "marginCoin": self.margin_coin,
-            "productType": self.product_type,
-        }
+def get_net_position(self, symbol: str) -> Dict[str, float]:
+    """
+    Return {'net': float}  (one-way 기준: longQty - shortQty)
+    안전화: singlePosition(symbol, marginCoin) -> 실패 시 allPosition(productType) 필터
+    """
+    # 1) 시도: singlePosition (symbol + marginCoin)
+    path = "/api/mix/v1/position/singlePosition"
+    params = {
+        "symbol": symbol,
+        "marginCoin": self.margin_coin
+        # productType 빼고 호출 (일부 리전에선 이 조합만 허용)
+    }
+    try:
         res = self._request("GET", path, params=params)
         net = 0.0
+        d = res.get("data") or {}
+        if isinstance(d, dict):
+            total = d.get("total", {}) or {}
+            long_qty = float(total.get("longTotalSize", "0") or "0")
+            short_qty = float(total.get("shortTotalSize", "0") or "0")
+            net = long_qty - short_qty
+        return {"net": net}
+    except requests.HTTPError:
+        # 2) 폴백: allPosition(productType) 후 심볼로 필터
+        path2 = "/api/mix/v1/position/allPosition"
+        params2 = {"productType": self.product_type}
+        res2 = self._request("GET", path2, params=params2)
+        net = 0.0
         try:
-            d = res.get("data") or {}
-            if isinstance(d, dict):
-                total = d.get("total", {}) or {}
-                long_qty = float(total.get("longTotalSize", "0") or "0")
-                short_qty = float(total.get("shortTotalSize", "0") or "0")
-                net = long_qty - short_qty
+            arr = res2.get("data") or []
+            for item in arr:
+                if item.get("symbol") == symbol:
+                    long_qty = float(item.get("longTotalSize", "0") or "0")
+                    short_qty = float(item.get("shortTotalSize", "0") or "0")
+                    net = long_qty - short_qty
+                    break
         except Exception:
             pass
         return {"net": net}
