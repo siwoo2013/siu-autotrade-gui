@@ -1,4 +1,3 @@
-# bitget_client.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -16,11 +15,12 @@ import requests
 
 class BitgetClient:
     """
-    Bitget Mix (UMCBL) REST client (sign-type=2).
+    Bitget Mix (UMCBL) REST client (sign-type=2, HMAC).
 
-    입력은 항상 one-way 논리(side="buy"/"sell")로 받되,
-    첫 실패(HTTP 4xx 등) 시 조건 없이 hedge 포맷(open_long/open_short/close_long/close_short)으로
-    1회 자동 재시도하는 핫픽스 적용.
+    - 기본 입력은 one-way 논리(side="buy"/"sell")로 받는다.
+    - 첫 실패 시(HTTP 4xx 또는 기타 예외) hedge 포맷(open_long/open_short/close_long/close_short)으로 1회 재시도.
+    - EA 편의 메서드 제공:
+        open_long / open_short / close_long / close_short
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -127,19 +127,19 @@ class BitgetClient:
 
         return resp.json()
 
-    # ---------------- public APIs ---------------- #
+    # ---------------- position helper ---------------- #
 
     def get_net_position(self, symbol: str) -> Dict[str, float]:
         """
         {'net': float} 반환 (one-way 기준: longQty - shortQty)
         1) singlePosition(symbol, marginCoin) 시도
-        2) 4xx면 allPosition(productType)로 폴백 후 심볼 필터
+        2) 실패 시 allPosition(productType) 폴백
         """
         # primary
         path = "/api/mix/v1/position/singlePosition"
         params = {
             "symbol": symbol,
-            "marginCoin": self.margin_coin,  # productType은 일부 리전에서 400 유발
+            "marginCoin": self.margin_coin,
         }
         try:
             res = self._request("GET", path, params=params)
@@ -222,7 +222,6 @@ class BitgetClient:
         1차: one-way 'buy'/'sell' 시도
         2차(핫픽스): 첫 실패(예외 발생) 시 조건 없이 hedge 키워드로 1회 재시도
         """
-        # 1) one-way 시도
         try:
             return self._send_place_order(
                 tv_symbol=tv_symbol,
@@ -234,7 +233,6 @@ class BitgetClient:
                 price=price,
                 time_in_force=time_in_force,
             )
-        # 2) HTTP 에러 → 강제 헤지 재시도
         except requests.HTTPError as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             code = None
@@ -258,7 +256,6 @@ class BitgetClient:
                 price=price,
                 time_in_force=time_in_force,
             )
-        # 3) 그 외 모든 예외도 동일하게 1회 재시도 (예외타입 차이 방지)
         except Exception as e:  # noqa: BLE001
             self.log.info("fallback trigger: non-HTTP exception=%r", e)
             hedge_side = self._map_side_for_hedge(side, reduce_only)
@@ -273,3 +270,31 @@ class BitgetClient:
                 price=price,
                 time_in_force=time_in_force,
             )
+
+    # -------- EA 편의 메서드 -------- #
+
+    def open_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
+        return self.place_order(
+            tv_symbol=symbol, side="buy", order_type=order_type, size=size,
+            reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open"
+        )
+
+    def open_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
+        return self.place_order(
+            tv_symbol=symbol, side="sell", order_type=order_type, size=size,
+            reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open"
+        )
+
+    def close_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
+        # long 청산은 sell + reduceOnly
+        return self.place_order(
+            tv_symbol=symbol, side="sell", order_type=order_type, size=size,
+            reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
+        )
+
+    def close_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
+        # short 청산은 buy + reduceOnly
+        return self.place_order(
+            tv_symbol=symbol, side="buy", order_type=order_type, size=size,
+            reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
+        )
