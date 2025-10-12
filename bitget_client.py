@@ -210,56 +210,38 @@ class BitgetClient:
             body["timeInForceValue"] = time_in_force
         return self._request("POST", path, body=body)
 
-    def place_order(
-        self,
-        *,
-        tv_symbol: str,
-        side: str,               # logical: "buy" | "sell"
-        order_type: str,         # "market" | "limit"
-        size: str,
-        reduce_only: bool = False,
-        client_oid: Optional[str] = None,
-        price: Optional[str] = None,          # for limit
-        time_in_force: Optional[str] = None,  # "normal"|"post_only"|"fok"|"ioc"
-    ) -> Dict[str, Any]:
-        """
-        Place order. If Bitget returns side-mismatch(400172), retry once with hedge side mapping.
-        """
+def place_order(
+    self,
+    *,
+    tv_symbol: str,
+    side: str,               # "buy" | "sell" (one-way)
+    order_type: str,         # "market" | "limit"
+    size: str,
+    reduce_only: bool = False,
+    client_oid: Optional[str] = None,
+    price: Optional[str] = None,
+    time_in_force: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    One-way 전용: buy/sell만 사용.
+    (이 버전은 hedge 재시도를 하지 않습니다.)
+    """
+    try:
+        return self._send_place_order(
+            tv_symbol=tv_symbol,
+            side=side,                     # ← buy / sell 그대로
+            order_type=order_type,
+            size=size,
+            reduce_only=reduce_only,
+            client_oid=client_oid,
+            price=price,
+            time_in_force=time_in_force,
+        )
+    except requests.HTTPError as e:
+        # 디버깅 보조용 로그만 남기고 그대로 올림
         try:
-            # 1) try logical one-way keywords ("buy"/"sell")
-            return self._send_place_order(
-                tv_symbol=tv_symbol,
-                side=side,
-                order_type=order_type,
-                size=size,
-                reduce_only=reduce_only,
-                client_oid=client_oid,
-                price=price,
-                time_in_force=time_in_force,
-            )
-        except requests.HTTPError as e:
-            # inspect response json
-            try:
-                j = e.response.json()
-            except Exception:
-                j = {}
-            code = str(j.get("code", ""))
-            msg = str(j.get("msg", "")).lower()
-
-            if code == "400172" or "side mismatch" in msg:
-                # 2) retry with hedge side mapping
-                hedge_side = self._map_side_for_hedge(side, reduce_only)
-                self.log.warning("Retrying with hedge side mapping: %s -> %s (reduceOnly=%s)",
-                                 side, hedge_side, reduce_only)
-                return self._send_place_order(
-                    tv_symbol=tv_symbol,
-                    side=hedge_side,
-                    order_type=order_type,
-                    size=size,
-                    reduce_only=reduce_only,    # Bitget ignores reduceOnly in hedge but keep for parity
-                    client_oid=(client_oid + "-h") if client_oid else None,
-                    price=price,
-                    time_in_force=time_in_force,
-                )
-            # not side-mismatch → bubble up
-            raise
+            j = e.response.json()
+            self.log.error("place_order failed(one-way): code=%s msg=%s", j.get("code"), j.get("msg"))
+        except Exception:
+            pass
+        raise
