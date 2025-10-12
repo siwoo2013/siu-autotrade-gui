@@ -18,9 +18,8 @@ class BitgetClient:
     Bitget Mix (UMCBL) REST client (sign-type=2, HMAC).
 
     - 기본 입력은 one-way 논리(side="buy"/"sell")로 받는다.
-    - 첫 실패 시(HTTP 4xx 또는 기타 예외) hedge 포맷(open_long/open_short/close_long/close_short)으로 1회 재시도.
-    - EA 편의 메서드 제공:
-        open_long / open_short / close_long / close_short
+    - 첫 실패(HTTP 4xx 또는 기타 예외) 시 hedge 포맷(open_long/open_short/close_long/close_short)으로 1회 재시도 (핫픽스).
+    - EA 편의 메서드 제공: open_long / open_short / close_long / close_short
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -137,10 +136,7 @@ class BitgetClient:
         """
         # primary
         path = "/api/mix/v1/position/singlePosition"
-        params = {
-            "symbol": symbol,
-            "marginCoin": self.margin_coin,
-        }
+        params = {"symbol": symbol, "marginCoin": self.margin_coin}
         try:
             res = self._request("GET", path, params=params)
             data = res.get("data") or {}
@@ -286,14 +282,14 @@ class BitgetClient:
         )
 
     def close_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        # long 청산은 sell + reduceOnly
+        # long 청산 = sell + reduceOnly
         return self.place_order(
             tv_symbol=symbol, side="sell", order_type=order_type, size=size,
             reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
         )
 
     def close_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        # short 청산은 buy + reduceOnly
+        # short 청산 = buy + reduceOnly
         return self.place_order(
             tv_symbol=symbol, side="buy", order_type=order_type, size=size,
             reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close"
