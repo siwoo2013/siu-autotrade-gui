@@ -4,8 +4,9 @@ import hmac
 import hashlib
 import base64
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import requests
+from urllib.parse import urlencode
 
 
 class BitgetHTTPError(Exception):
@@ -17,10 +18,10 @@ class BitgetHTTPError(Exception):
 
 class BitgetClient:
     """
-    Minimal Bitget mix API client tailored for SIU autotrade usage.
-    - Implements proper signing for REST requests
-    - place_order() ensures holdSide is present so Bitget doesn't reject direction
-    - Accepts legacy 'mode' param for backward compatibility (ignored)
+    Bitget mix API client for SIU autotrade.
+    - FIX: GET/DELETE 서명 시 querystring 포함
+    - place_order: holdSide 명시 (open_long/short, close_long/short)
+    - __init__ mode 파라미터 호환 (무시)
     """
 
     def __init__(
@@ -32,37 +33,45 @@ class BitgetClient:
         product_type: str = "umcbl",
         margin_coin: str = "USDT",
         timeout: int = 10,
-        # ---- backward compatibility (ignored) ----
-        mode: Optional[str] = None,
+        mode: Optional[str] = None,   # backward-compat only (ignored)
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
         self.base = base.rstrip("/")
         self.timeout = timeout
-        self.PRODUCT_TYPE = product_type  # e.g. "umcbl" or "umcb" or "p"
-        self.MARGIN_COIN = margin_coin  # USDT normally
-        self._compat_mode = mode  # kept only for backwards compatibility
+        self.PRODUCT_TYPE = product_type
+        self.MARGIN_COIN = margin_coin
+        self._compat_mode = mode
 
         self.session = requests.Session()
-        self.session.trust_env = False  # avoid inheriting proxies
+        self.session.trust_env = False
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
 
-    # ----------------------
-    # Signing & low-level
-    # ----------------------
+    # -------------- signing --------------
+
+    @staticmethod
+    def _build_signed_path(path: str, params: Optional[Dict[str, Any]]) -> str:
+        """
+        Bitget 서명은 requestPath(+querystring) 이어야 함.
+        params가 있으면 키 정렬 후 urlencode 해서 '?a=1&b=2' 붙임.
+        """
+        request_path = path if path.startswith("/") else f"/{path}"
+        if params:
+            # Bitget는 key 정렬된 쿼리를 권장
+            items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+            query = urlencode(items, doseq=False)
+            if query:
+                request_path = f"{request_path}?{query}"
+        return request_path
+
     def _sign(self, timestamp: str, method: str, request_path: str, body: str) -> str:
-        """
-        Bitget HMAC-SHA256 sign: base64( HMAC_SHA256(secret, timestamp + method + requestPath + body) )
-        """
-        method = method.upper()
-        prehash = f"{timestamp}{method}{request_path}{body or ''}"
-        h = hmac.new(self.api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256)
-        signature = base64.b64encode(h.digest()).decode()
-        return signature
+        payload = f"{timestamp}{method.upper()}{request_path}{body or ''}"
+        mac = hmac.new(self.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256)
+        return base64.b64encode(mac.digest()).decode()
 
     def _request(
         self,
@@ -72,27 +81,22 @@ class BitgetClient:
         body: Optional[Dict] = None,
         retries: int = 3,
     ) -> Dict[str, Any]:
-        """
-        Low-level request with signing, JSON parse and error mapping.
-        Returns parsed JSON (dict), or raises BitgetHTTPError for HTTP / API failures.
-        """
         method = method.upper()
-        request_path = path if path.startswith("/") else f"/{path}"
-        url = f"{self.base}{request_path}"
+        signed_path = self._build_signed_path(path, params)
+        url = f"{self.base}{signed_path}"
 
         body_str = ""
         if body is not None:
-            # Bitget expects JSON body string for signing
             body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
         for attempt in range(1, retries + 1):
-            timestamp = str(int(time.time() * 1000))
-            sign = self._sign(timestamp, method, request_path, body_str)
+            ts = str(int(time.time() * 1000))
+            sign = self._sign(ts, method, signed_path, body_str)
 
             headers = {
                 "ACCESS-KEY": self.api_key,
                 "ACCESS-SIGN": sign,
-                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-TIMESTAMP": ts,
                 "ACCESS-PASSPHRASE": self.passphrase,
                 "Content-Type": "application/json",
             }
@@ -100,8 +104,7 @@ class BitgetClient:
             try:
                 resp = self.session.request(
                     method=method,
-                    url=url,
-                    params=params,
+                    url=url,  # 이미 signed_path에 query 포함됨
                     data=body_str.encode("utf-8") if body_str else None,
                     headers=headers,
                     timeout=self.timeout,
@@ -121,86 +124,55 @@ class BitgetClient:
 
             if status != 200:
                 raise BitgetHTTPError(status, parsed)
-
             return parsed
 
         raise BitgetHTTPError(-1, "request-retries-exhausted")
 
-    # ----------------------
-    # Utility: hedge sizes
-    # ----------------------
+    # -------------- positions --------------
+
     def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
         """
-        Query position/sizes for the mixed perpetual.
-        Returns: {'long': float, 'short': float}
-        Handles different 'data' shapes Bitget may return.
+        /api/mix/v1/position/singlePosition
+        다양한 응답 포맷을 안전하게 파싱 → {'long': float, 'short': float}
         """
         path = "/api/mix/v1/position/singlePosition"
         params = {"symbol": symbol, "marginCoin": self.MARGIN_COIN, "productType": self.PRODUCT_TYPE}
-
         res = self._request("GET", path, params=params)
 
         data = res.get("data", res) if isinstance(res, dict) else res
-
         long_size = 0.0
         short_size = 0.0
 
-        if isinstance(data, list):
-            for item in data:
-                side = item.get("side") or item.get("holdSide") or ""
-                size_val = item.get("size") or item.get("position") or 0
-                try:
-                    size_f = float(size_val)
-                except Exception:
-                    size_f = 0.0
-                sl = str(side).lower()
-                if sl in ("long", "open_long", "buy", "open_buy"):
-                    long_size += size_f
-                elif sl in ("short", "open_short", "sell", "open_sell"):
-                    short_size += size_f
-                else:
-                    hold = (item.get("holdSide") or "").lower()
-                    if "long" in hold:
-                        long_size += size_f
-                    elif "short" in hold:
-                        short_size += size_f
+        def add(side_val, size_val):
+            nonlocal long_size, short_size
+            try:
+                sz = float(size_val or 0)
+            except Exception:
+                sz = 0.0
+            side = (side_val or "").lower()
+            if side in ("long", "open_long", "buy", "open_buy"):
+                long_size += sz
+            elif side in ("short", "open_short", "sell", "open_sell"):
+                short_size += sz
 
+        if isinstance(data, list):
+            for it in data:
+                add(it.get("side") or it.get("holdSide"), it.get("size") or it.get("position"))
         elif isinstance(data, dict):
             if "total" in data:
                 total = data.get("total") or {}
                 long_size = float(total.get("longSize", 0) or total.get("long", 0) or 0)
                 short_size = float(total.get("shortSize", 0) or total.get("short", 0) or 0)
-            elif "positions" in data and isinstance(data["positions"], list):
-                for item in data["positions"]:
-                    side = item.get("side") or item.get("holdSide") or ""
-                    size_val = item.get("size") or item.get("position") or 0
-                    try:
-                        size_f = float(size_val)
-                    except Exception:
-                        size_f = 0.0
-                    sl = str(side).lower()
-                    if sl in ("long", "open_long", "buy"):
-                        long_size += size_f
-                    elif sl in ("short", "open_short", "sell"):
-                        short_size += size_f
+            elif isinstance(data.get("positions"), list):
+                for it in data["positions"]:
+                    add(it.get("side") or it.get("holdSide"), it.get("size") or it.get("position"))
             else:
-                side = data.get("side") or data.get("holdSide") or ""
-                size_val = data.get("size") or data.get("position") or 0
-                try:
-                    size_f = float(size_val)
-                except Exception:
-                    size_f = 0.0
-                sl = str(side).lower()
-                if sl in ("long", "open_long", "buy"):
-                    long_size += size_f
-                elif sl in ("short", "open_short", "sell"):
-                    short_size += size_f
+                add(data.get("side") or data.get("holdSide"), data.get("size") or data.get("position"))
 
         return {"long": float(long_size), "short": float(short_size)}
 
-    # ----------------------
-    # Place order (mix)
-    # ----------------------
+    # -------------- orders --------------
+
     def place_order(
         self,
         *,
@@ -212,23 +184,20 @@ class BitgetClient:
         client_oid: Optional[str] = None,
     ) -> str:
         """
-        Place an order on mix market with explicit holdSide to avoid 'direction empty' error.
-
-        - reduce_only=False (entry):
-            side="buy"  -> holdSide = "open_long"
-            side="sell" -> holdSide = "open_short"
-        - reduce_only=True (close):
-            side="buy"  -> holdSide = "close_short"
-            side="sell" -> holdSide = "close_long"
+        mix placeOrder
+        reduce_only=False: buy->open_long, sell->open_short
+        reduce_only=True : buy->close_short, sell->close_long
         """
         s = side.lower().strip()
         if s not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
 
-        if reduce_only:
-            hold_side = "close_long" if s == "sell" else "close_short"
-        else:
-            hold_side = "open_long" if s == "buy" else "open_short"
+        hold_side = (
+            "close_long" if (reduce_only and s == "sell") else
+            "close_short" if (reduce_only and s == "buy") else
+            "open_long" if s == "buy" else
+            "open_short"
+        )
 
         path = "/api/mix/v1/order/placeOrder"
         body = {
@@ -236,10 +205,10 @@ class BitgetClient:
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": str(size),
-            "holdSide": hold_side,          # 핵심
-            "side": s,                      # 보조
+            "holdSide": hold_side,
+            "side": s,
             "orderType": order_type.lower(),
-            "reduceOnly": True if reduce_only else False,
+            "reduceOnly": bool(reduce_only),
         }
         if client_oid:
             body["clientOid"] = client_oid
@@ -250,16 +219,11 @@ class BitgetClient:
             raise BitgetHTTPError(400, res)
 
         data = res.get("data") or {}
-        order_id = data.get("orderId") or data.get("order_id") or data.get("id") or ""
-        return str(order_id)
+        return str(data.get("orderId") or data.get("order_id") or data.get("id") or "")
 
     def reverse_order(self, symbol: str, target_side: str, size: float) -> str:
-        """
-        Convenience for 'order.reverse'.
-        target_side: "BUY" or "SELL"
-        """
-        t = str(target_side).upper()
+        t = target_side.upper()
         if t not in ("BUY", "SELL"):
             raise ValueError("target_side must be BUY or SELL")
-        side = "buy" if t == "BUY" else "sell"
-        return self.place_order(symbol=symbol, side=side, order_type="market", size=size, reduce_only=False)
+        s = "buy" if t == "BUY" else "sell"
+        return self.place_order(symbol=symbol, side=s, order_type="market", size=size, reduce_only=False)
