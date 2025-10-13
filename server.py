@@ -30,7 +30,24 @@ bg = BitgetClient(
     mode=TRADE_MODE,
     timeout=10,
 )
+from fastapi import FastAPI
 
+@app.on_event("startup")
+async def _startup():
+    try:
+        mode = bg.ensure_unilateral_mode()  # ← 계정을 single_hold로 강제 전환/확인
+        log.info(f"[startup] ensured unilateral mode -> {mode}")
+    except Exception as e:
+        log.warning(f"[startup] ensure_unilateral_mode failed: {e}")
+
+@app.get("/mode")
+def get_mode():
+    try:
+        mode = bg.query_position_mode()
+        return {"ok": True, "mode": mode}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
 # TV 심볼 → Bitget 심볼 매핑(UMCBL 선물)
 SYMBOL_MAP = {
     "BTCUSDT.P": "BTCUSDT_UMCBL",
