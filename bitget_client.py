@@ -17,9 +17,9 @@ from urllib3.exceptions import ProtocolError
 
 class BitgetClient:
     """
-    Bitget Mix (UMCBL) REST client (sign-type=2, HMAC).
+    Bitget Mix (UMCBL) REST client (sign-type=2, HMAC base64).
     - _request: 일시 오류 재시도(지수 백오프)
-    - get_hedge_sizes: data가 dict/list 모두 올바르게 파싱
+    - get_hedge_sizes / get_hedge_detail / get_last_price 제공
     """
 
     BASE_URL = "https://api.bitget.com"
@@ -142,59 +142,87 @@ class BitgetClient:
             raise last_exc
         raise RuntimeError("Bitget request failed without response")
 
+    # ---------------- market ---------------- #
+
+    def get_last_price(self, symbol: str) -> float:
+        """현재가(틱커)"""
+        res = self._request("GET", "/api/mix/v1/market/ticker", params={"symbol": symbol})
+        data = res.get("data", {}) or {}
+        # price 키가 region/버전에 따라 다를 수 있어 가능한 후보를 사용
+        for k in ("last", "lastPrice", "close", "closePrice"):
+            v = data.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        raise RuntimeError(f"ticker parse failed: {data}")
+
     # ---------------- positions ---------------- #
 
-    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
+    def get_hedge_detail(self, symbol: str) -> Dict[str, Dict[str, float]]:
         """
-        현재 심볼의 롱/숏 총 수량 조회 (hedge 모드 기준).
-        Bitget가 data를 dict 또는 list 형태로 줄 수 있어 둘 다 파싱한다.
-
-        return {"long": float, "short": float}
+        현재 심볼의 롱/숏 {size, avgPrice} 조회 (hedge 모드 기준).
+        return {"long": {"size": float, "avg": float}, "short": {...}}
         """
         path = "/api/mix/v1/position/singlePosition"
         params = {"symbol": symbol, "marginCoin": self.margin_coin}
         res = self._request("GET", path, params=params)
 
         data = res.get("data", {})
-        long_qty = 0.0
-        short_qty = 0.0
+        long_size = short_size = 0.0
+        long_avg = short_avg = 0.0
 
-        # ① data가 dict이고 data.total 안에 합계가 들어오는 경우
+        # dict(total/long/short) 형식
         if isinstance(data, dict):
-            total = data.get("total", {}) or {}
-            if isinstance(total, dict):
-                long_qty = float(total.get("longTotalSize", 0) or 0)
-                short_qty = float(total.get("shortTotalSize", 0) or 0)
-            else:
-                # dict인데 total이 없으면 포지션 0으로 간주
-                long_qty = 0.0
-                short_qty = 0.0
+            long_node = data.get("long") or {}
+            short_node = data.get("short") or {}
+            try:
+                long_size = float(long_node.get("total", 0) or long_node.get("available", 0) or 0)
+            except Exception:
+                pass
+            try:
+                short_size = float(short_node.get("total", 0) or short_node.get("available", 0) or 0)
+            except Exception:
+                pass
+            try:
+                long_avg = float(long_node.get("averageOpenPrice", 0) or long_node.get("avgOpenPrice", 0) or 0)
+            except Exception:
+                pass
+            try:
+                short_avg = float(short_node.get("averageOpenPrice", 0) or short_node.get("avgOpenPrice", 0) or 0)
+            except Exception:
+                pass
 
-        # ② data가 list(레그별 객체)로 오는 경우
+        # list(레그별) 형식
         elif isinstance(data, list):
             for p in data:
                 if not isinstance(p, dict):
                     continue
                 side = (p.get("holdSide") or p.get("side") or "").lower()
-                # 가능한 수량 키들 중 하나를 사용
-                size = (
-                    p.get("total", None)
-                    or p.get("totalSize", None)
-                    or p.get("available", None)
-                    or p.get("availableSize", None)
-                    or 0
-                )
+                size = p.get("total") or p.get("totalSize") or p.get("available") or p.get("availableSize") or 0
+                avg = p.get("averageOpenPrice") or p.get("avgOpenPrice") or 0
                 try:
                     fsize = float(size or 0)
                 except Exception:
                     fsize = 0.0
+                try:
+                    favg = float(avg or 0)
+                except Exception:
+                    favg = 0.0
 
                 if side.startswith("long"):
-                    long_qty += fsize
+                    long_size += fsize
+                    long_avg = favg or long_avg
                 elif side.startswith("short"):
-                    short_qty += fsize
+                    short_size += fsize
+                    short_avg = favg or short_avg
 
-        return {"long": float(long_qty), "short": float(short_qty)}
+        return {"long": {"size": long_size, "avg": long_avg}, "short": {"size": short_size, "avg": short_avg}}
+
+    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
+        d = self.get_hedge_detail(symbol)
+        return {"long": d["long"]["size"], "short": d["short"]["size"]}
 
     # ---- hedge helpers ----
     @staticmethod

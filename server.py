@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 import requests
 from fastapi import FastAPI, Request
@@ -21,6 +21,10 @@ BITGET_API_SECRET = os.environ.get("BITGET_API_SECRET", "")
 BITGET_PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 TRADE_MODE = os.environ.get("TRADE_MODE", "live")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+# TP(익절) 퍼센트, 체크 주기
+TP_PERCENT = float(os.environ.get("TP_PERCENT", "0.07"))           # 7% 기본
+TP_CHECK_SEC = float(os.environ.get("TP_CHECK_SEC", "2.0"))        # 2초마다 체크
 
 # =========================
 # APP / LOGGER
@@ -63,6 +67,7 @@ def normalize_symbol(sym: str) -> str:
     return s
 
 _symbol_locks: dict[str, asyncio.Lock] = {}
+_watch_symbols: Set[str] = set()  # 익절 모니터링 대상 심볼
 
 
 def symbol_lock(symbol: str) -> asyncio.Lock:
@@ -96,13 +101,12 @@ async def ensure_close_full(symbol: str, side_to_close: str, *, max_retry: int =
     backoff = 0.30  # sec
 
     for attempt in range(1, max_retry + 1):
-        # 포지션 조회 실패도 재시도
         try:
-            sizes = bg.get_hedge_sizes(symbol)
-            long_sz = float(sizes["long"] or 0)
-            short_sz = float(sizes["short"] or 0)
+            detail = bg.get_hedge_detail(symbol)
+            long_sz = float(detail["long"]["size"] or 0)
+            short_sz = float(detail["short"]["size"] or 0)
         except Exception as e:
-            logger.info("get_hedge_sizes failed (retrying) #%s %s: %r", attempt, symbol, e)
+            logger.info("get_hedge_detail failed (retrying) #%s %s: %r", attempt, symbol, e)
             await sleep_ms(int(backoff * 1000))
             backoff = min(backoff * 1.5, 1.2)
             continue
@@ -135,9 +139,9 @@ async def ensure_close_full(symbol: str, side_to_close: str, *, max_retry: int =
         # 체결 반영 대기 + 재확인
         await sleep_ms(int(backoff * 1000))
         try:
-            sizes2 = bg.get_hedge_sizes(symbol)
-            long2 = float(sizes2["long"] or 0)
-            short2 = float(sizes2["short"] or 0)
+            d2 = bg.get_hedge_detail(symbol)
+            long2 = float(d2["long"]["size"] or 0)
+            short2 = float(d2["short"]["size"] or 0)
         except Exception:
             long2 = long_sz
             short2 = short_sz
@@ -152,11 +156,74 @@ async def ensure_close_full(symbol: str, side_to_close: str, *, max_retry: int =
     return {"ok": False, "error": "close_not_flat", "detail": last_detail}
 
 # =========================
+# TP MONITOR (익절 7%)
+# =========================
+async def tp_monitor_loop():
+    """
+    _watch_symbols 에 등록된 심볼을 주기적으로 검사해서
+    - 롱: (last - avg) / avg >= TP_PERCENT → 롱 전량 reduceOnly 청산
+    - 숏: (avg - last) / avg >= TP_PERCENT → 숏 전량 reduceOnly 청산
+    """
+    logger.info("[tp] monitor started: TP_PERCENT=%.4f, interval=%.2fs", TP_PERCENT, TP_CHECK_SEC)
+    while True:
+        try:
+            for sym in list(_watch_symbols):
+                try:
+                    d = bg.get_hedge_detail(sym)
+                    long_sz = float(d["long"]["size"] or 0)
+                    short_sz = float(d["short"]["size"] or 0)
+                    long_avg = float(d["long"]["avg"] or 0)
+                    short_avg = float(d["short"]["avg"] or 0)
+
+                    # 포지션 없으면 스킵
+                    if long_sz <= 0 and short_sz <= 0:
+                        continue
+
+                    last = bg.get_last_price(sym)
+
+                    # 롱 TP
+                    if long_sz > 0 and long_avg > 0:
+                        up = (last - long_avg) / long_avg
+                        if up >= TP_PERCENT:
+                            logger.info("[tp] LONG take-profit %.4f >= %.4f | %s last=%.4f avg=%.4f size=%.6f",
+                                        up, TP_PERCENT, sym, last, long_avg, long_sz)
+                            bg.close_long(sym, size=_fmt_qty(long_sz))
+
+                    # 숏 TP
+                    if short_sz > 0 and short_avg > 0:
+                        up = (short_avg - last) / short_avg
+                        if up >= TP_PERCENT:
+                            logger.info("[tp] SHORT take-profit %.4f >= %.4f | %s last=%.4f avg=%.4f size=%.6f",
+                                        up, TP_PERCENT, sym, last, short_avg, short_sz)
+                            bg.close_short(sym, size=_fmt_qty(short_sz))
+
+                except Exception as e:
+                    logger.info("[tp] monitor error on %s: %r", sym, e)
+
+            await asyncio.sleep(TP_CHECK_SEC)
+        except Exception as e:
+            logger.info("[tp] loop exception: %r", e)
+            await asyncio.sleep(TP_CHECK_SEC)
+
+
+@app.on_event("startup")
+async def _startup():
+    # TP 모니터 백그라운드 태스크 시작
+    asyncio.create_task(tp_monitor_loop())
+
+# =========================
 # ROUTES
 # =========================
 @app.get("/")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "siu-autotrade-gui", "mode": TRADE_MODE}
+    return {
+        "ok": True,
+        "service": "siu-autotrade-gui",
+        "mode": TRADE_MODE,
+        "tp_percent": TP_PERCENT,
+        "tp_interval": TP_CHECK_SEC,
+        "watch": list(_watch_symbols),
+    }
 
 
 @app.post("/tv")
@@ -195,15 +262,21 @@ async def tv(request: Request):
     # 심볼별 직렬화
     async with symbol_lock(symbol):
 
+        # ✅ 신규 진입 전 현재 포지션 확인 가능 (필요 시 조회)
         if route == "order.open":
             try:
+                d = bg.get_hedge_detail(symbol)
+                # 신규 진입 (양방향: 반대 보유와 무관)
                 if target_side == "BUY":
                     res = bg.open_long(symbol, size, order_type)
                 elif target_side == "SELL":
                     res = bg.open_short(symbol, size, order_type)
                 else:
                     return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
-                return {"ok": True, "result": res}
+
+                # TP 모니터에 등록
+                _watch_symbols.add(symbol)
+                return {"ok": True, "before": d, "result": res}
             except requests.HTTPError as e:
                 try:
                     detail = e.response.json()
@@ -233,6 +306,8 @@ async def tv(request: Request):
                 else:
                     return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
 
+                # TP 모니터에 등록
+                _watch_symbols.add(symbol)
                 return {"ok": True, "closed": close_res, "opened": open_res}
 
             except requests.HTTPError as e:
