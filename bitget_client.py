@@ -20,6 +20,7 @@ class BitgetClient:
     Minimal Bitget mix API client tailored for SIU autotrade usage.
     - Implements proper signing for REST requests
     - place_order() ensures holdSide is present so Bitget doesn't reject direction
+    - Accepts legacy 'mode' param for backward compatibility (ignored)
     """
 
     def __init__(
@@ -31,6 +32,8 @@ class BitgetClient:
         product_type: str = "umcbl",
         margin_coin: str = "USDT",
         timeout: int = 10,
+        # ---- backward compatibility (ignored) ----
+        mode: Optional[str] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -39,10 +42,10 @@ class BitgetClient:
         self.timeout = timeout
         self.PRODUCT_TYPE = product_type  # e.g. "umcbl" or "umcb" or "p"
         self.MARGIN_COIN = margin_coin  # USDT normally
+        self._compat_mode = mode  # kept only for backwards compatibility
 
         self.session = requests.Session()
-        # Avoid inheriting local environment proxies (optional)
-        self.session.trust_env = False
+        self.session.trust_env = False  # avoid inheriting proxies
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -61,7 +64,14 @@ class BitgetClient:
         signature = base64.b64encode(h.digest()).decode()
         return signature
 
-    def _request(self, method: str, path: str, params: Optional[Dict] = None, body: Optional[Dict] = None, retries: int = 3) -> Dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict] = None,
+        body: Optional[Dict] = None,
+        retries: int = 3,
+    ) -> Dict[str, Any]:
         """
         Low-level request with signing, JSON parse and error mapping.
         Returns parsed JSON (dict), or raises BitgetHTTPError for HTTP / API failures.
@@ -97,29 +107,23 @@ class BitgetClient:
                     timeout=self.timeout,
                 )
             except requests.RequestException as e:
-                # connection-level errors: retry a few times
                 if attempt < retries:
                     time.sleep(0.5 * attempt)
                     continue
                 raise BitgetHTTPError(-1, str(e))
 
-            # try to parse JSON body (if any)
-            text = resp.text or ""
             status = resp.status_code
+            text = resp.text or ""
             try:
                 parsed = resp.json() if text else {}
             except Exception:
                 parsed = {"raw_text": text}
 
             if status != 200:
-                # Some 4xx/5xx responses still include JSON with 'code'/'msg'
                 raise BitgetHTTPError(status, parsed)
 
-            # Some Bitget endpoints return {"code":"00000","msg":"success","data":...}
-            # Normalize: return parsed
             return parsed
 
-        # If all retries exhausted
         raise BitgetHTTPError(-1, "request-retries-exhausted")
 
     # ----------------------
@@ -129,20 +133,18 @@ class BitgetClient:
         """
         Query position/sizes for the mixed perpetual.
         Returns: {'long': float, 'short': float}
-        This function is resilient to different shapes of 'data' returned by Bitget.
+        Handles different 'data' shapes Bitget may return.
         """
         path = "/api/mix/v1/position/singlePosition"
         params = {"symbol": symbol, "marginCoin": self.MARGIN_COIN, "productType": self.PRODUCT_TYPE}
 
         res = self._request("GET", path, params=params)
 
-        # Bitget returns sometimes top-level code & data fields; handle various shapes
         data = res.get("data", res) if isinstance(res, dict) else res
 
         long_size = 0.0
         short_size = 0.0
 
-        # If data is a list of positions
         if isinstance(data, list):
             for item in data:
                 side = item.get("side") or item.get("holdSide") or ""
@@ -151,20 +153,19 @@ class BitgetClient:
                     size_f = float(size_val)
                 except Exception:
                     size_f = 0.0
-                # determine long vs short
-                if str(side).lower() in ("long", "open_long", "buy", "open_buy"):
+                sl = str(side).lower()
+                if sl in ("long", "open_long", "buy", "open_buy"):
                     long_size += size_f
-                elif str(side).lower() in ("short", "open_short", "sell", "open_sell"):
+                elif sl in ("short", "open_short", "sell", "open_sell"):
                     short_size += size_f
                 else:
-                    # fallback: check 'holdSide' field explicitly
                     hold = (item.get("holdSide") or "").lower()
                     if "long" in hold:
                         long_size += size_f
                     elif "short" in hold:
                         short_size += size_f
+
         elif isinstance(data, dict):
-            # some endpoints return {'total': {...}, 'positions': [...]}
             if "total" in data:
                 total = data.get("total") or {}
                 long_size = float(total.get("longSize", 0) or total.get("long", 0) or 0)
@@ -177,26 +178,23 @@ class BitgetClient:
                         size_f = float(size_val)
                     except Exception:
                         size_f = 0.0
-                    if str(side).lower() in ("long", "open_long", "buy"):
+                    sl = str(side).lower()
+                    if sl in ("long", "open_long", "buy"):
                         long_size += size_f
-                    elif str(side).lower() in ("short", "open_short", "sell"):
+                    elif sl in ("short", "open_short", "sell"):
                         short_size += size_f
             else:
-                # If single position object returned
                 side = data.get("side") or data.get("holdSide") or ""
                 size_val = data.get("size") or data.get("position") or 0
                 try:
                     size_f = float(size_val)
                 except Exception:
                     size_f = 0.0
-                if str(side).lower() in ("long", "open_long", "buy"):
+                sl = str(side).lower()
+                if sl in ("long", "open_long", "buy"):
                     long_size += size_f
-                elif str(side).lower() in ("short", "open_short", "sell"):
+                elif sl in ("short", "open_short", "sell"):
                     short_size += size_f
-        else:
-            # unexpected shape -> return zeros
-            long_size = 0.0
-            short_size = 0.0
 
         return {"long": float(long_size), "short": float(short_size)}
 
@@ -216,12 +214,12 @@ class BitgetClient:
         """
         Place an order on mix market with explicit holdSide to avoid 'direction empty' error.
 
-        - When reduce_only is False (new entry):
+        - reduce_only=False (entry):
             side="buy"  -> holdSide = "open_long"
             side="sell" -> holdSide = "open_short"
-        - When reduce_only is True (close / reduce):
-            side="buy"  -> holdSide = "close_short"  (buy to close shorts)
-            side="sell" -> holdSide = "close_long"   (sell to close longs)
+        - reduce_only=True (close):
+            side="buy"  -> holdSide = "close_short"
+            side="sell" -> holdSide = "close_long"
         """
         s = side.lower().strip()
         if s not in ("buy", "sell"):
@@ -233,15 +231,13 @@ class BitgetClient:
             hold_side = "open_long" if s == "buy" else "open_short"
 
         path = "/api/mix/v1/order/placeOrder"
-
         body = {
             "symbol": symbol,
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": str(size),
-            # crucial: include holdSide and side
-            "holdSide": hold_side,
-            "side": s,
+            "holdSide": hold_side,          # 핵심
+            "side": s,                      # 보조
             "orderType": order_type.lower(),
             "reduceOnly": True if reduce_only else False,
         }
@@ -249,33 +245,21 @@ class BitgetClient:
             body["clientOid"] = client_oid
 
         res = self._request("POST", path, body=body)
-
-        # Bitget usually returns {"code":"00000","msg":"success","data":{...}}
         code = str(res.get("code") or res.get("status") or "")
-        if code not in ("00000", "0", "0"):  # accept typical success codes
-            # if 'msg' or 'detail' present include
+        if code not in ("00000", "0"):
             raise BitgetHTTPError(400, res)
 
         data = res.get("data") or {}
         order_id = data.get("orderId") or data.get("order_id") or data.get("id") or ""
         return str(order_id)
 
-    # convenience wrapper
     def reverse_order(self, symbol: str, target_side: str, size: float) -> str:
         """
-        For 'order.reverse' semantics: choose side and reduceOnly appropriately.
-        target_side: "BUY" or "SELL" (target desired position side)
-        If reversing from existing hedge, implementation at caller-level will choose
-        reduceOnly/holdSide; here we create a new order to reach target_side.
+        Convenience for 'order.reverse'.
+        target_side: "BUY" or "SELL"
         """
         t = str(target_side).upper()
         if t not in ("BUY", "SELL"):
             raise ValueError("target_side must be BUY or SELL")
-        # For a straight 'reverse' we usually place an order with reduceOnly=False to open target side
         side = "buy" if t == "BUY" else "sell"
         return self.place_order(symbol=symbol, side=side, order_type="market", size=size, reduce_only=False)
-
-
-# Example usage:
-# bg = BitgetClient(os.getenv("BITGET_API_KEY"), os.getenv("BITGET_API_SECRET"), os.getenv("BITGET_PASSPHRASE"))
-# bg.place_order(symbol="BTCUSDT_UMCBL", side="buy", size=0.001)
