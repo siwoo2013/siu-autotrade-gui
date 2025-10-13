@@ -204,28 +204,39 @@ class BitgetClient:
         # 최종 실패
         raise last_exc or RuntimeError("get_hedge_sizes failed")
 
-    def place_order(
+   def place_order(
         self,
         *,
         symbol: str,
-        side: str,                # "buy" | "sell"
+        side: str,                # "buy" | "sell" 그대로 유지
         order_type: str = "market",
         size: float,
         reduce_only: bool = False,
         client_oid: Optional[str] = None,
     ) -> str:
         """
-        마켓/리듀스온리 주문.
-        POST /api/mix/v1/order/placeOrder
-        필드: symbol, productType, marginCoin, size, side, orderType, reduceOnly, clientOid
+        Hedge 모드 대응:
+        - 롱 진입: holdSide="open_long"
+        - 숏 진입: holdSide="open_short"
+        - 롱 청산: holdSide="close_long"
+        - 숏 청산: holdSide="close_short"
         """
+        side = side.lower()
+        hold_side = None
+        if reduce_only:
+            # 청산 주문
+            hold_side = "close_long" if side == "sell" else "close_short"
+        else:
+            # 신규 진입
+            hold_side = "open_long" if side == "buy" else "open_short"
+
         body = {
             "symbol": symbol,
             "productType": "umcbl",
             "marginCoin": "USDT",
             "size": str(size),
-            "side": side.lower(),
-            "orderType": order_type.lower(),  # "market"
+            "holdSide": hold_side,
+            "orderType": order_type.lower(),
             "reduceOnly": True if reduce_only else False,
         }
         if client_oid:
