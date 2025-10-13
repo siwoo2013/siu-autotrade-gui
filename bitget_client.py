@@ -1,228 +1,276 @@
-# bitget_client.py — Unilateral(원웨이) 확정판
-# - side: 'buy' / 'sell' 만 사용 (open_long 등 사용하지 않음)
-# - holdSide 절대 전송 금지
-# - ms 타임스탬프 + 서버시간 동기화 + 40008 자동 재시도
-# - 포지션 조회: /position/allPosition
-# - ensure_unilateral_mode(): 계정 포지션모드를 single_hold로 보정
+# -*- coding: utf-8 -*-
+"""
+Bitget REST client (UMCBL / One-Way 전용)
+- 안정화 포인트:
+  * 모든 요청에 'Connection: close' 강제 (keep-alive 재사용 끊기)
+  * ConnectionResetError / requests.ConnectionError 재시도(지수 백오프)
+  * 5xx/429 자동 재시도
+- 서버(server.py) 기대 시그니처에 맞춤:
+    BitgetClient(api_key, api_secret, passphrase, mode="live", timeout=10)
+    .get_hedge_sizes(symbol)
+    .place_order(symbol, side, order_type, size, reduce_only, client_oid)
+    .place_market_order(symbol, side, size, reduce_only=False)
+    .query_position_mode()         (가능하면; 실패 시 예외)
+    .ensure_unilateral_mode()      (가능하면; 실패 시 예외)
+- 심볼은 server.py에서 BTCUSDT.P -> BTCUSDT_UMCBL 로 변환되어 들어온다고 가정.
+"""
 
 import time
 import json
 import hmac
-import base64
+import hashlib
 import logging
-from typing import Any, Dict, Optional, List
-from urllib.parse import urlencode
+from typing import Dict, Any, Optional
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("uvicorn.error")
 
+
 class BitgetHTTPError(Exception):
-    def __init__(self, status_code: int, payload: Any):
-        self.status_code = status_code
-        self.payload = payload
-        super().__init__(f"bitget-http status={status_code} body={payload}")
+    def __init__(self, status: int, body: str):
+        super().__init__(f"bitget-http status={status} body={body}")
+        self.status = status
+        self.body = body
+
 
 class BitgetClient:
-    BASE_URL = "https://api.bitget.com"
-    PRODUCT_TYPE = "umcbl"
-    MARGIN_COIN = "USDT"
-
-    def __init__(self, api_key: str, api_secret: str, passphrase: str,
-                 mode: str = "live", timeout: int = 10, session: Optional[requests.Session] = None):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        passphrase: str,
+        mode: str = "live",
+        timeout: int = 10,
+        base_url: Optional[str] = None,
+    ):
         self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_secret = api_secret.encode()
         self.passphrase = passphrase
-        self.mode = (mode or "live").lower()
         self.timeout = timeout
-        self.session = session or requests.Session()
-        self._time_offset_ms = 0
 
-        if not (self.api_key and self.api_secret and self.passphrase):
-            log.warning("BitgetClient: API key/secret/passphrase not fully provided.")
+        # Bitget U本位 선물(UMCBL) 표준 도메인
+        self.base_url = base_url or "https://api.bitget.com"
 
-        try:
-            self.sync_time()
-        except Exception as e:
-            log.warning(f"BitgetClient: initial time sync failed: {e}")
+        # requests.Session with robust retry
+        self.session = self._new_session()
 
-    # ---------- time/sign ----------
-    def _now_ms(self) -> int:
-        return int(time.time() * 1000)
+        # 제품 계열 (umcbl) 고정 사용. marginCoin은 USDT로.
+        self.margin_coin = "USDT"
+        self.product_type = "umcbl"
 
-    def _timestamp(self) -> str:
-        return str(self._now_ms() + self._time_offset_ms)
+    # ---------- Session / Retry ----------
+    def _new_session(self) -> requests.Session:
+        s = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        # 헤더 기본값
+        s.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-CHANNEL-API-CODE": "siu-autotrade",  # 임의 식별자(옵션)
+            # 핵심: keep-alive 재사용 끊기 (연결 재설정 방지)
+            "Connection": "close",
+        })
+        return s
 
-    def sync_time(self):
-        path = "/api/mix/v1/market/time"
-        url = self.BASE_URL + path
-        resp = self.session.get(url, timeout=self.timeout)
-        resp.raise_for_status()
-        js = resp.json()
-        code = str(js.get("code") or js.get("status") or "")
-        if code not in ("00000", "0"):
-            raise RuntimeError(js)
-        server_ms = int(js.get("data"))
-        local_ms = self._now_ms()
-        self._time_offset_ms = server_ms - local_ms
-        log.info(f"Bitget time sync: offset={self._time_offset_ms}ms")
+    # ---------- Sign ----------
+    @staticmethod
+    def _ts_ms() -> str:
+        return str(int(time.time() * 1000))
 
-    def _sign(self, ts: str, method: str, request_path: str, body_str: str) -> str:
-        msg = f"{ts}{method.upper()}{request_path}{body_str}"
-        mac = hmac.new(self.api_secret.encode(), msg.encode(), digestmod="sha256")
-        return base64.b64encode(mac.digest()).decode()
+    def _sign(self, ts: str, method: str, path_with_qs: str, body: str) -> str:
+        # bitget: sign = HMAC_SHA256(timestamp + method + requestPath + body)
+        message = f"{ts}{method.upper()}{path_with_qs}{body}".encode()
+        return hmac.new(self.api_secret, message, hashlib.sha256).hexdigest()
 
-    def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        return {
+    # ---------- Low-level request with retry for ConnectionReset ----------
+    def _request(self, method: str, path: str, params: dict = None, body: dict = None) -> Any:
+        url = self.base_url + path
+        params = params or {}
+        body = body or {}
+
+        qs = ""
+        if params:
+            # Bitget는 쿼리 문자열도 시그니처에 포함되도록 requestPath 그대로 사용해야 함
+            items = [f"{k}={params[k]}" for k in sorted(params.keys())]
+            qs = "?" + "&".join(items)
+
+        request_path_for_sign = path + qs
+        payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        ts = self._ts_ms()
+        sign = self._sign(ts, method, request_path_for_sign, payload if method.upper() != "GET" else "")
+
+        headers = {
             "ACCESS-KEY": self.api_key,
             "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
             "ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json",
+            "ACCESS-TIMESTAMP": ts,
+            "Locale": "en-US",
+            # keep-alive로 인한 재사용을 끊기
+            "Connection": "close",
         }
 
-    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
-                 body: Optional[Dict[str, Any]] = None, _retry_on_40008: bool = True) -> Any:
-        method = method.upper()
-        url = self.BASE_URL + path
-
-        query = ""
-        if params:
-            query = "?" + urlencode(params, doseq=True)
-            url += query
-
-        body_str = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False) if body else ""
-        ts = self._timestamp()
-        sign = self._sign(ts, method, path + (query if query else ""), body_str)
-        headers = self._headers(ts, sign)
-
-        try:
-            if method == "GET":
-                resp = self.session.get(url, headers=headers, timeout=self.timeout)
-            elif method == "POST":
-                resp = self.session.post(url, data=body_str, headers=headers, timeout=self.timeout)
-            elif method == "DELETE":
-                resp = self.session.delete(url, data=body_str, headers=headers, timeout=self.timeout)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-        except requests.RequestException as e:
-            raise BitgetHTTPError(-1, f"requests-error: {e}") from e
-
-        if not (200 <= resp.status_code < 300):
-            raise BitgetHTTPError(resp.status_code, f"http-error: {resp.text}")
-
-        try:
-            data = resp.json()
-        except Exception:
-            raise BitgetHTTPError(resp.status_code, f"invalid-json: {resp.text}")
-
-        code = str(data.get("code") or data.get("status") or "")
-        if code not in ("00000", "0"):
-            if _retry_on_40008 and ("40008" in json.dumps(data)):
-                log.warning("Bitget 40008 detected → resync time & retry once")
-                try:
-                    self.sync_time()
-                except Exception as e:
-                    log.warning(f"time resync failed: {e}")
-                return self._request(method, path, params, body, _retry_on_40008=False)
-            raise BitgetHTTPError(resp.status_code, data)
-
-        return data
-
-    # ---------- account/mode ----------
-    def query_position_mode(self) -> str:
-        """현재 포지션 모드 반환: 'single_hold' | 'double_hold'"""
-        path = "/api/mix/v1/account/queryPositionMode"
-        params = {"productType": self.PRODUCT_TYPE}
-        res = self._request("GET", path, params=params)
-        return str((res.get("data") or {}).get("holdMode") or "")
-
-    def set_unilateral_mode(self) -> bool:
-        """single_hold(원웨이)로 전환"""
-        path = "/api/mix/v1/account/setPositionMode"
-        body = {"productType": self.PRODUCT_TYPE, "holdMode": "single_hold"}
-        res = self._request("POST", path, body=body)
-        return bool(res.get("data") == "success")
-
-    def ensure_unilateral_mode(self) -> str:
-        """원웨이 모드가 아니면 single_hold로 전환하고 결과를 리턴"""
-        try:
-            cur = self.query_position_mode()
-        except Exception as e:
-            log.warning(f"query_position_mode failed: {e}")
-            cur = ""
-        if cur != "single_hold":
+        # 실제 호출 (Connection reset 시도 시 세션 재생성하여 재시도)
+        attempts = 0
+        last_exc: Optional[Exception] = None
+        while attempts < 3:
             try:
-                ok = self.set_unilateral_mode()
-                new_mode = self.query_position_mode() if ok else cur
-                log.info(f"ensure_unilateral_mode: set→{ok}, mode={new_mode}")
-                return new_mode
-            except Exception as e:
-                log.warning(f"set_unilateral_mode failed: {e}")
-                return cur
-        return cur
+                if method.upper() == "GET":
+                    resp = self.session.get(url, headers=headers, params=params, timeout=(4, self.timeout), verify=True)
+                else:
+                    resp = self.session.post(url, headers=headers, params=params, data=payload, timeout=(4, self.timeout), verify=True)
 
-    # ---------- orders/positions ----------
-    def place_order(self, symbol: str, side: str, order_type: str, size: float,
-                    reduce_only: bool = False, client_oid: str = "", price: Optional[float] = None) -> str:
-        """원웨이용 주문: side='buy'/'sell'만 사용. reduce_only=True면 청산 전용."""
-        s = (side or "").lower().strip()
-        if s not in ("buy", "sell"):
-            raise ValueError("side must be 'buy' or 'sell'")
-        ot = (order_type or "").lower().strip()
-        if ot not in ("market", "limit"):
-            raise ValueError("order_type must be 'market' or 'limit'")
+                # Bitget 표준 응답 처리
+                if resp.status_code >= 400:
+                    raise BitgetHTTPError(resp.status_code, f"http-error: {resp.text}")
 
-        path = "/api/mix/v1/order/placeOrder"
-        body: Dict[str, Any] = {
+                data = resp.json()
+                # 일부 v1 API는 {"code":"00000","msg":"success","data":...} 형태
+                # 실패일 때 code != "00000"
+                if isinstance(data, dict) and "code" in data and data["code"] not in ("00000", 0, "0"):
+                    raise BitgetHTTPError(resp.status_code, f"api-error: {resp.text}")
+
+                return data.get("data") if isinstance(data, dict) and "data" in data else data
+
+            except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
+                last_exc = e
+                log.warning(f"[bitget] connection error, retrying... attempts={attempts+1} err={e}")
+                # 세션 완전 재생성
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = self._new_session()
+                time.sleep(0.6 * (attempts + 1))
+                attempts += 1
+                continue
+            except requests.exceptions.ReadTimeout as e:
+                last_exc = e
+                log.warning(f"[bitget] read timeout, retrying... attempts={attempts+1}")
+                time.sleep(0.6 * (attempts + 1))
+                attempts += 1
+                continue
+
+        # 모든 재시도 실패
+        if last_exc:
+            raise BitgetHTTPError(-1, f"body=requests-error: {repr(last_exc)}")
+        raise BitgetHTTPError(-1, "unknown-error")
+
+    # ---------- Public-ish helpers ----------
+    def server_time(self) -> Any:
+        # v1 마켓 타임은 지역별로 404가 날 수 있어; 실패해도 무시 권장
+        try:
+            return self._request("GET", "/api/mix/v1/market/time")
+        except BitgetHTTPError as e:
+            log.warning(f"BitgetClient: initial time sync failed: {e}")
+            return None
+
+    # ---------- Position / Accounts ----------
+    def _positions(self, symbol: str) -> Any:
+        # GET /api/mix/v1/position/singlePosition?symbol=BTCUSDT_UMCBL&marginCoin=USDT
+        params = {"symbol": symbol, "marginCoin": self.margin_coin}
+        return self._request("GET", "/api/mix/v1/position/singlePosition", params=params)
+
+    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
+        """
+        원웨이 기준이라도, API 응답에는 long/short 구성이 들어온다.
+        없으면 0.0으로 처리.
+        """
+        data = self._positions(symbol)
+        long_sz = 0.0
+        short_sz = 0.0
+        if isinstance(data, dict):
+            long_pos = data.get("long")
+            short_pos = data.get("short")
+            if isinstance(long_pos, dict):
+                try:
+                    long_sz = float(long_pos.get("total", 0))  # 포지션 수량 키는 total or available depending on API
+                except Exception:
+                    pass
+            if isinstance(short_pos, dict):
+                try:
+                    short_sz = float(short_pos.get("total", 0))
+                except Exception:
+                    pass
+        return {"long": long_sz, "short": short_sz}
+
+    # ---------- Orders ----------
+    def place_order(
+        self,
+        *,
+        symbol: str,
+        side: str,                 # "buy" | "sell"
+        order_type: str,           # "market" | "limit"
+        size: float,
+        reduce_only: bool = False,
+        client_oid: Optional[str] = None,
+        price: Optional[float] = None,
+    ) -> str:
+        """
+        POST /api/mix/v1/order/placeOrder
+        returns clientOid (또는 orderId 계열) 문자열
+        """
+        body = {
             "symbol": symbol,
-            "productType": self.PRODUCT_TYPE,
-            "marginCoin": self.MARGIN_COIN,
-            "size": str(size),
-            "side": s,                       # ✅ 원웨이: buy/sell
-            "orderType": ot,
-            "reduceOnly": bool(reduce_only), # ✅ 청산 시 True
+            "marginCoin": self.margin_coin,
+            "size": f"{size}",
+            "side": side.lower(),                   # buy / sell
+            "orderType": order_type.lower(),        # market / limit
+            "reduceOnly": reduce_only,
+            "timeInForceValue": "normal",
         }
         if client_oid:
             body["clientOid"] = client_oid
-        if price is not None and ot == "limit":
-            body["price"] = str(price)
+        if price is not None:
+            body["price"] = f"{price}"
 
-        res = self._request("POST", path, body=body)
-        data = res.get("data") or {}
-        return str(data.get("orderId") or data.get("order_id") or data.get("id") or "")
+        data = self._request("POST", "/api/mix/v1/order/placeOrder", body=body)
+        # 성공 시 {"orderId":"...","clientOid":"..."}류가 오는데, 통일해서 clientOid 우선 반환
+        if isinstance(data, dict):
+            return str(data.get("clientOid") or data.get("orderId") or "")
+        return str(data)
 
-    def _all_positions(self) -> List[Dict[str, Any]]:
-        path = "/api/mix/v1/position/allPosition"
-        params = {"productType": self.PRODUCT_TYPE}
-        res = self._request("GET", path, params=params)
-        return res.get("data") or []
+    def place_market_order(self, *, symbol: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
+        oid = self.place_order(
+            symbol=symbol,
+            side=side,
+            order_type="market",
+            size=size,
+            reduce_only=reduce_only,
+            client_oid=f"siu-{int(time.time()*1000)}",
+        )
+        return {"clientOid": oid, "symbol": symbol, "side": side, "size": size, "reduceOnly": reduce_only}
 
-    def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
-        """원웨이도 인터페이스 통일을 위해 long/short 키로 리턴"""
-        items = self._all_positions()
-        long_sz = short_sz = 0.0
-        for it in items:
-            if it.get("symbol") != symbol:
-                continue
-            hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
-            total = float(it.get("total") or it.get("available") or it.get("openAmount") or 0.0)
-            if hold_side == "long":  long_sz += total
-            elif hold_side == "short": short_sz += total
-        return {"long": float(long_sz), "short": float(short_sz)}
+    # ---------- Mode Ops (best-effort) ----------
+    def query_position_mode(self) -> str:
+        """
+        Bitget에 모드 조회 API가 리전/버전에 따라 다르므로, 실패 시 BitgetHTTPError 발생할 수 있음.
+        """
+        # 일부 문서 기준: GET /api/mix/v1/account/positionMode?productType=umcbl
+        params = {"productType": self.product_type}
+        data = self._request("GET", "/api/mix/v1/account/positionMode", params=params)
+        # {"holdMode":"single_hold"} 기대
+        if isinstance(data, dict):
+            return str(data.get("holdMode") or data.get("posMode") or "unknown")
+        return "unknown"
 
-    def get_avg_entry_price(self, symbol: str) -> float:
-        items = self._all_positions()
-        long_price = short_price = None
-        for it in items:
-            if it.get("symbol") != symbol:
-                continue
-            hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
-            avg = float(it.get("avgOpenPrice") or it.get("openPrice") or 0.0)
-            total = float(it.get("total") or 0.0)
-            if total <= 0: 
-                continue
-            if hold_side == "long" and avg > 0:  long_price = avg
-            elif hold_side == "short" and avg > 0: short_price = avg
-        if long_price: return float(long_price)
-        if short_price: return float(short_price)
-        return 0.0
+    def ensure_unilateral_mode(self) -> str:
+        """
+        단방향 모드로 전환. 실패하면 예외(404 등) 던질 수 있음.
+        """
+        # POST /api/mix/v1/account/setPositionMode  body: {"productType":"umcbl","holdMode":"single_hold"}
+        body = {"productType": self.product_type, "holdMode": "single_hold"}
+        self._request("POST", "/api/mix/v1/account/setPositionMode", body=body)
+        return "single_hold"
