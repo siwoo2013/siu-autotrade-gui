@@ -1,8 +1,9 @@
-# bitget_client.py
-# - Mix 선물(UMCBL) 원웨이 호환
-# - 주문 side: open_long/open_short/close_long/close_short (buy/sell 사용 안 함)
-# - 타임스탬프 ms + 서버시간 동기화 + 40008 자동 재시도
-# - 포지션 조회: /position/allPosition 사용
+# bitget_client.py — Unilateral(원웨이) 확정판
+# - side: 'buy' / 'sell' 만 사용 (open_long 등 사용하지 않음)
+# - holdSide 절대 전송 금지
+# - ms 타임스탬프 + 서버시간 동기화 + 40008 자동 재시도
+# - 포지션 조회: /position/allPosition
+# - ensure_unilateral_mode(): 계정 포지션모드를 single_hold로 보정
 
 import time
 import json
@@ -11,11 +12,9 @@ import base64
 import logging
 from typing import Any, Dict, Optional, List
 from urllib.parse import urlencode
-
 import requests
 
 log = logging.getLogger("uvicorn.error")
-
 
 class BitgetHTTPError(Exception):
     def __init__(self, status_code: int, payload: Any):
@@ -23,21 +22,13 @@ class BitgetHTTPError(Exception):
         self.payload = payload
         super().__init__(f"bitget-http status={status_code} body={payload}")
 
-
 class BitgetClient:
     BASE_URL = "https://api.bitget.com"
-    PRODUCT_TYPE = "umcbl"   # USDT-M Perp
+    PRODUCT_TYPE = "umcbl"
     MARGIN_COIN = "USDT"
 
-    def __init__(
-        self,
-        api_key: str,
-        api_secret: str,
-        passphrase: str,
-        mode: str = "live",
-        timeout: int = 10,
-        session: Optional[requests.Session] = None,
-    ):
+    def __init__(self, api_key: str, api_secret: str, passphrase: str,
+                 mode: str = "live", timeout: int = 10, session: Optional[requests.Session] = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
@@ -54,7 +45,7 @@ class BitgetClient:
         except Exception as e:
             log.warning(f"BitgetClient: initial time sync failed: {e}")
 
-    # ------------ 시간/서명 ------------
+    # ---------- time/sign ----------
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
 
@@ -89,14 +80,8 @@ class BitgetClient:
             "Content-Type": "application/json",
         }
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        body: Optional[Dict[str, Any]] = None,
-        _retry_on_40008: bool = True,
-    ) -> Any:
+    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
+                 body: Optional[Dict[str, Any]] = None, _retry_on_40008: bool = True) -> Any:
         method = method.upper()
         url = self.BASE_URL + path
 
@@ -143,37 +128,49 @@ class BitgetClient:
 
         return data
 
-    # ------------ 주문/포지션 ------------
-    def _mix_side(self, side: str, reduce_only: bool) -> str:
-        """
-        입력: side='buy'|'sell', reduce_only(bool)
-        출력: Bitget mix side(open_long/open_short/close_long/close_short)
-        """
+    # ---------- account/mode ----------
+    def query_position_mode(self) -> str:
+        """현재 포지션 모드 반환: 'single_hold' | 'double_hold'"""
+        path = "/api/mix/v1/account/queryPositionMode"
+        params = {"productType": self.PRODUCT_TYPE}
+        res = self._request("GET", path, params=params)
+        return str((res.get("data") or {}).get("holdMode") or "")
+
+    def set_unilateral_mode(self) -> bool:
+        """single_hold(원웨이)로 전환"""
+        path = "/api/mix/v1/account/setPositionMode"
+        body = {"productType": self.PRODUCT_TYPE, "holdMode": "single_hold"}
+        res = self._request("POST", path, body=body)
+        return bool(res.get("data") == "success")
+
+    def ensure_unilateral_mode(self) -> str:
+        """원웨이 모드가 아니면 single_hold로 전환하고 결과를 리턴"""
+        try:
+            cur = self.query_position_mode()
+        except Exception as e:
+            log.warning(f"query_position_mode failed: {e}")
+            cur = ""
+        if cur != "single_hold":
+            try:
+                ok = self.set_unilateral_mode()
+                new_mode = self.query_position_mode() if ok else cur
+                log.info(f"ensure_unilateral_mode: set→{ok}, mode={new_mode}")
+                return new_mode
+            except Exception as e:
+                log.warning(f"set_unilateral_mode failed: {e}")
+                return cur
+        return cur
+
+    # ---------- orders/positions ----------
+    def place_order(self, symbol: str, side: str, order_type: str, size: float,
+                    reduce_only: bool = False, client_oid: str = "", price: Optional[float] = None) -> str:
+        """원웨이용 주문: side='buy'/'sell'만 사용. reduce_only=True면 청산 전용."""
         s = (side or "").lower().strip()
         if s not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
-        if reduce_only:
-            # long 청산은 sell, short 청산은 buy
-            return "close_long" if s == "sell" else "close_short"
-        else:
-            # 신규 오픈: buy→open_long, sell→open_short
-            return "open_long" if s == "buy" else "open_short"
-
-    def place_order(
-        self,
-        symbol: str,
-        side: str,                 # 'buy' or 'sell'
-        order_type: str,           # 'market' or 'limit'
-        size: float,
-        reduce_only: bool = False,
-        client_oid: str = "",
-        price: Optional[float] = None,
-    ) -> str:
         ot = (order_type or "").lower().strip()
         if ot not in ("market", "limit"):
             raise ValueError("order_type must be 'market' or 'limit'")
-
-        mix_side = self._mix_side(side, reduce_only)
 
         path = "/api/mix/v1/order/placeOrder"
         body: Dict[str, Any] = {
@@ -181,8 +178,9 @@ class BitgetClient:
             "productType": self.PRODUCT_TYPE,
             "marginCoin": self.MARGIN_COIN,
             "size": str(size),
-            "side": mix_side,              # ✅ open_/close_ 형태로 전송
+            "side": s,                       # ✅ 원웨이: buy/sell
             "orderType": ot,
+            "reduceOnly": bool(reduce_only), # ✅ 청산 시 True
         }
         if client_oid:
             body["clientOid"] = client_oid
@@ -194,49 +192,37 @@ class BitgetClient:
         return str(data.get("orderId") or data.get("order_id") or data.get("id") or "")
 
     def _all_positions(self) -> List[Dict[str, Any]]:
-        """모든 포지션(해당 productType)을 가져온다."""
         path = "/api/mix/v1/position/allPosition"
         params = {"productType": self.PRODUCT_TYPE}
         res = self._request("GET", path, params=params)
         return res.get("data") or []
 
     def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
-        """
-        long/short 보유 수량을 합산해 리턴(원웨이도 동일 인터페이스).
-        """
+        """원웨이도 인터페이스 통일을 위해 long/short 키로 리턴"""
         items = self._all_positions()
-        long_sz = 0.0
-        short_sz = 0.0
+        long_sz = short_sz = 0.0
         for it in items:
             if it.get("symbol") != symbol:
                 continue
             hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
-            # Bitget 응답: total | available | openAmount 등 케이스가 다양 → 우선 total
             total = float(it.get("total") or it.get("available") or it.get("openAmount") or 0.0)
-            if hold_side == "long":
-                long_sz += total
-            elif hold_side == "short":
-                short_sz += total
+            if hold_side == "long":  long_sz += total
+            elif hold_side == "short": short_sz += total
         return {"long": float(long_sz), "short": float(short_sz)}
 
     def get_avg_entry_price(self, symbol: str) -> float:
         items = self._all_positions()
-        long_price = None
-        short_price = None
+        long_price = short_price = None
         for it in items:
             if it.get("symbol") != symbol:
                 continue
             hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
             avg = float(it.get("avgOpenPrice") or it.get("openPrice") or 0.0)
             total = float(it.get("total") or 0.0)
-            if total <= 0:
+            if total <= 0: 
                 continue
-            if hold_side == "long" and avg > 0:
-                long_price = avg
-            elif hold_side == "short" and avg > 0:
-                short_price = avg
-        if long_price:
-            return float(long_price)
-        if short_price:
-            return float(short_price)
+            if hold_side == "long" and avg > 0:  long_price = avg
+            elif hold_side == "short" and avg > 0: short_price = avg
+        if long_price: return float(long_price)
+        if short_price: return float(short_price)
         return 0.0
