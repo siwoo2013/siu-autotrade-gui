@@ -2,7 +2,9 @@ import hashlib
 import hmac
 import json
 import time
+import base64
 from typing import Any, Dict, Optional, Tuple, List
+from urllib.parse import urlencode
 
 import requests
 
@@ -13,10 +15,10 @@ class BitgetHTTPError(Exception):
 
 class BitgetClient:
     """
-    최소한의 Bitget U本位(UMCBL) 선물 연동 래퍼.
-    - 네트워크/Bitget 오류 메시지를 풍부하게 남기도록 _request 강화
-    - singlePosition 조회 시 productType=umcbl 명시 (400 방지)
-    - 응답이 dict/list 어느 쪽이어도 파싱되게 방어코드
+    Bitget U 本位(UMCBL) 최소 래퍼
+    - 서명(Base64)로 수정 → 40009(sign signature error) 해결
+    - singlePosition 호출에 productType=umcbl 명시
+    - 응답이 dict/list 모두 방어적으로 파싱
     """
 
     def __init__(
@@ -49,12 +51,15 @@ class BitgetClient:
         params: Dict[str, Any],
         body: Dict[str, Any],
     ) -> str:
+        """
+        Bitget spec:
+          sign = base64( HMAC_SHA256( secret, timestamp + method + path + query + body ) )
+          - query 는 '?' + urlencode(params) (없으면 빈 문자열)
+          - body 는 공백 없는 JSON 문자열
+        """
         query = ""
         if params:
-            # Bitget는 Query string을 key=value&key2=value2 순으로 붙여 넣어야 함
-            query = "?" + "&".join(
-                f"{k}={params[k]}" for k in sorted(params.keys())
-            )
+            query = "?" + urlencode(params, doseq=True)
 
         payload = ""
         if body:
@@ -65,8 +70,8 @@ class BitgetClient:
             self.api_secret.encode("utf-8"),
             prehash.encode("utf-8"),
             digestmod=hashlib.sha256,
-        ).hexdigest()
-        return digest
+        ).digest()
+        return base64.b64encode(digest).decode()
 
     def _request(
         self,
@@ -75,9 +80,6 @@ class BitgetClient:
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Bitget REST 요청. 2xx가 아니면 Bitget code/msg와 함께 예외 발생.
-        """
         url = self.base + path
         ts = str(int(time.time() * 1000))
         q = params or {}
@@ -101,7 +103,6 @@ class BitgetClient:
             timeout=self.timeout,
         )
 
-        # 2xx면 정상
         if 200 <= resp.status_code < 300:
             try:
                 data = resp.json()
@@ -109,15 +110,12 @@ class BitgetClient:
                 raise BitgetHTTPError(
                     f"bitget-http invalid-json status={resp.status_code} body={resp.text[:300]}"
                 )
-            # Bitget 표준 성공 코드는 '00000'
             if isinstance(data, dict) and data.get("code") not in (None, "00000", 0):
                 raise BitgetHTTPError(
                     f"bitget-http code={data.get('code')} msg={data.get('msg')}"
                 )
-            # 보통 'data' 필드에 실제 페이로드가 들어옴
             return data.get("data", data)
 
-        # 비정상: Bitget의 code/msg를 최대한 추출해 로그 풍부화
         try:
             j = resp.json()
             code = j.get("code")
@@ -135,11 +133,6 @@ class BitgetClient:
     # -------------------------------------------------------------------------
 
     def get_hedge_sizes(self, symbol: str) -> Tuple[float, float]:
-        """
-        현재 심볼의 헤지 모드 포지션 수량(long/short)을 반환.
-        Bitget가 상황에 따라 data를 dict/list 어느 쪽으로 주는지 몰라서 전부 대비.
-        또한 일부 환경에서 productType=umcbl을 요구하므로 명시한다.
-        """
         path = "/api/mix/v1/position/singlePosition"
         params = {
             "symbol": symbol,
@@ -148,7 +141,6 @@ class BitgetClient:
         }
         data = self._request("GET", path, params=params)
 
-        # data가 dict일 수도, list일 수도 있음
         if isinstance(data, dict):
             items: List[Dict[str, Any]] = data.get("data") or data.get("positions") or []
         else:
@@ -165,7 +157,6 @@ class BitgetClient:
 
         for it in items:
             hold = (it.get("holdSide") or it.get("side") or "").lower()
-            # 크기 키 이름이 환경에 따라 다를 수 있어 방어적 파싱
             size = _to_f(it.get("total") or it.get("totalSize") or it.get("available") or 0)
             if hold == "long":
                 long_sz = size
@@ -181,16 +172,12 @@ class BitgetClient:
     def place_order(
         self,
         symbol: str,
-        side: str,  # "buy" | "sell"
+        side: str,
         size: float,
-        order_type: str = "market",  # "market" | "limit"
+        order_type: str = "market",
         reduce_only: bool = False,
         client_oid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        일반 주문(시장가/지정가). Hedge 모드 사용.
-        side: "buy"(=LONG 오픈 or SHORT 청산), "sell"(=SHORT 오픈 or LONG 청산)
-        """
         path = "/api/mix/v1/order/placeOrder"
         body = {
             "symbol": symbol,
@@ -203,21 +190,11 @@ class BitgetClient:
         }
         if client_oid:
             body["clientOid"] = client_oid
-
         return self._request("POST", path, body=body)
 
-    # 전량 청산(holdSide 기준)
-    def close_all(
-        self,
-        symbol: str,
-        hold_side: str,  # "long" | "short"
-    ) -> Dict[str, Any]:
-        """
-        해당 holdSide 전량 청산 (시장가)
-        """
+    def close_all(self, symbol: str, hold_side: str) -> Dict[str, Any]:
         if hold_side.lower() not in ("long", "short"):
             raise ValueError("hold_side must be 'long' or 'short'")
-
         path = "/api/mix/v1/position/closePosition"
         body = {
             "symbol": symbol,
@@ -228,22 +205,16 @@ class BitgetClient:
         return self._request("POST", path, body=body)
 
     # -------------------------------------------------------------------------
-    # TP 설정 (포지션 기준으로 TP만)
+    # TP 설정
     # -------------------------------------------------------------------------
 
     def set_tp_percent(
         self,
         symbol: str,
-        hold_side: str,  # "long" | "short"
-        percent: float,  # 0.07 = +7%
+        hold_side: str,
+        percent: float,
         entry_price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        포지션 기준 TP(익절) 플랜 등록. percent는 +7% == 0.07 처럼 전달.
-        - entry_price가 없으면 singlePosition 정보에서 평균가를 추정.
-        - Bitget POST /api/mix/v1/plan/placeTPSL 사용.
-        """
-        # 평균가가 없으면 조회
         if entry_price is None:
             path = "/api/mix/v1/position/singlePosition"
             params = {
@@ -265,12 +236,11 @@ class BitgetClient:
                 entry_price = None
 
         if not entry_price or entry_price <= 0:
-            # 평균가를 못 찾으면 TP 설정은 스킵 (주문 자체는 이미 체결됐으므로 동작엔 지장 없음)
             return None
 
         if hold_side.lower() == "long":
             trigger_price = entry_price * (1.0 + percent)
-        else:  # short
+        else:
             trigger_price = entry_price * (1.0 - percent)
 
         path = "/api/mix/v1/plan/placeTPSL"
@@ -278,7 +248,7 @@ class BitgetClient:
             "symbol": symbol,
             "marginCoin": "USDT",
             "productType": "umcbl",
-            "planType": "tp",            # take-profit
+            "planType": "tp",
             "triggerType": "market_price",
             "triggerPrice": f"{trigger_price:.2f}",
             "holdSide": hold_side.lower(),
