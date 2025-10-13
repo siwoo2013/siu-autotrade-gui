@@ -149,41 +149,24 @@ async def tv(request: Request) -> JSONResponse:
             return JSONResponse({"ok": False, "error": "only-market-supported"}, status_code=200)
 
         # ---------- 라우트 처리 ----------
-        if route == "order.open":
-            # 신규 오픈: BUY -> long open (buy), SELL -> short open (sell)
-            open_side = "buy" if target_side == "BUY" else "sell"
+if route == "order.open":
+    # --- 포지션 오픈 ---
+    opened = bg.place_market_order(symbol, target_side, size)
+    
+    # --- TP 임시 OFF ---
+    entry = 0.0
+    tp_price = 0.0
+    tp_id = None
+    # if tp_price > 0:
+    #     tp_side = "sell" if target_side == "BUY" else "buy"
+    #     tp_id = bg.place_tp_order(symbol=symbol, side=tp_side, trigger_price=tp_price, size=size)
+    
+    return jsonify({
+        "ok": True,
+        "opened": opened,
+        "tp_price": tp_price
+    })
 
-            # 먼저 반대 포지션이 있으면 청산(안 있으면 skip)
-            close_first = await ensure_close_full(symbol, "SHORT" if target_side == "BUY" else "LONG")
-
-            # 신규 오픈
-            oid = bg.place_order(
-                symbol=symbol,
-                side=open_side,
-                order_type="market",
-                size=size,
-                reduce_only=False,
-                client_oid=f"tv-{target_side.lower()}-open",
-            )
-
-            # TP: 평균가 조회 -> 7% profit에서 트리거
-            entry = bg.get_avg_entry_price(symbol)
-            tp_price = compute_tp_price(entry, target_side, 0.07)
-            tp_id = None
-            if tp_price > 0:
-                tp_side = "sell" if target_side == "BUY" else "buy"  # 익절은 반대체결
-                tp_id = bg.place_tp_order(symbol=symbol, side=tp_side, trigger_price=tp_price, size=size)
-
-            return JSONResponse(
-                {
-                    "ok": True,
-                    "route": route,
-                    "opened": {"orderId": oid, "side": target_side, "size": size},
-                    "closed_first": close_first,
-                    "tp": {"trigger_price": tp_price, "tp_id": tp_id},
-                },
-                status_code=200,
-            )
 
         elif route == "order.reverse":
             # Reverse: 현재 포지션을 반대방향으로 뒤집음
