@@ -1,9 +1,6 @@
 # bitget_client.py
-# - One-Way 모드 호환: 주문에 holdSide 절대 전송하지 않음
-# - 서버(server.py)가 사용하는 최소 메서드만 안정적으로 제공
-#   * place_order()
-#   * get_hedge_sizes()  -> one-way에서도 long/short 형태로 리턴(내부 변환)
-#   * get_avg_entry_price()
+# - One-Way 호환: 주문에 holdSide 미전송
+# - Timestamp ms 전송 + 서버시간 오프셋 동기화 + 40008 자동 재시도
 
 import time
 import json
@@ -19,7 +16,6 @@ log = logging.getLogger("uvicorn.error")
 
 
 class BitgetHTTPError(Exception):
-    """Bitget API에서 비정상 응답(code != 00000 / HTTP 오류)시 발생"""
     def __init__(self, status_code: int, payload: Any):
         self.status_code = status_code
         self.payload = payload
@@ -27,14 +23,8 @@ class BitgetHTTPError(Exception):
 
 
 class BitgetClient:
-    """
-    Bitget USDT-M 선물(UMCBL) 전용 클라이언트 (One-Way 모드 호환)
-    - 주문 시 holdSide 미전송
-    - 포지션 조회로 long/short 보유량을 유추
-    """
-
     BASE_URL = "https://api.bitget.com"
-    PRODUCT_TYPE = "umcbl"   # API 파라미터는 소문자 사용 권장
+    PRODUCT_TYPE = "umcbl"
     MARGIN_COIN = "USDT"
 
     def __init__(
@@ -52,19 +42,53 @@ class BitgetClient:
         self.mode = (mode or "live").lower()
         self.timeout = timeout
         self.session = session or requests.Session()
+        self._time_offset_ms = 0  # local -> server 보정값(ms)
 
-        # 간단한 유효성 체크
         if not (self.api_key and self.api_secret and self.passphrase):
             log.warning("BitgetClient: API key/secret/passphrase not fully provided.")
 
+        # 시작 시 서버 시간 동기화
+        try:
+            self.sync_time()
+        except Exception as e:
+            log.warning(f"BitgetClient: initial time sync failed: {e}")
+
     # -------------------------------
-    # 내부: 서명/요청
+    # 시간 동기화 & 서명
     # -------------------------------
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
     def _timestamp(self) -> str:
-        # Bitget는 초 단위 문자열(밀리초 허용). 여기서는 초 단위로 전송.
-        return str(int(time.time()))
+        # Bitget은 밀리초 문자열 권장
+        return str(self._now_ms() + self._time_offset_ms)
+
+    def sync_time(self):
+        """
+        Bitget 서버 시간과 로컬 시간의 차이를 보정한다.
+        """
+        try:
+            # mix 또는 spot 시간 엔드포인트 둘 중 하나 사용 가능
+            # /api/mix/v1/market/time 응답 예: {"code":"00000","msg":"success","requestTime":...,"data":<server_ms>}
+            path = "/api/mix/v1/market/time"
+            url = self.BASE_URL + path
+            resp = self.session.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            js = resp.json()
+            code = str(js.get("code") or js.get("status") or "")
+            if code not in ("00000", "0"):
+                raise RuntimeError(js)
+
+            server_ms = int(js.get("data"))
+            local_ms = self._now_ms()
+            self._time_offset_ms = server_ms - local_ms
+            log.info(f"Bitget time sync: server_ms={server_ms}, local_ms={local_ms}, offset={self._time_offset_ms}ms")
+
+        except Exception as e:
+            raise RuntimeError(f"time sync failed: {e}")
 
     def _sign(self, ts: str, method: str, request_path: str, body_str: str) -> str:
+        # Bitget: sign = base64( HMAC_SHA256(secret, ts + method + request_path + body) )
         msg = f"{ts}{method.upper()}{request_path}{body_str}"
         mac = hmac.new(self.api_secret.encode(), msg.encode(), digestmod="sha256")
         return base64.b64encode(mac.digest()).decode()
@@ -73,10 +97,9 @@ class BitgetClient:
         return {
             "ACCESS-KEY": self.api_key,
             "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-TIMESTAMP": ts,      # 밀리초 문자열
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
-            "locale": "en-US",
         }
 
     def _request(
@@ -85,14 +108,14 @@ class BitgetClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
+        _retry_on_40008: bool = True,
     ) -> Any:
         """
-        Bitget REST 요청. 실패 시 BitgetHTTPError 발생.
+        Bitget REST 요청. 40008(시간 만료)시 1회 자동 재동기화 후 재시도.
         """
         method = method.upper()
         url = self.BASE_URL + path
 
-        # 쿼리스트링 구성 (GET 등)
         query = ""
         if params:
             query = "?" + urlencode(params, doseq=True)
@@ -112,15 +135,12 @@ class BitgetClient:
                 resp = self.session.delete(url, data=body_str, headers=headers, timeout=self.timeout)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-
         except requests.RequestException as e:
             raise BitgetHTTPError(-1, f"requests-error: {e}") from e
 
-        # HTTP 오류
         if not (200 <= resp.status_code < 300):
             raise BitgetHTTPError(resp.status_code, f"http-error: {resp.text}")
 
-        # Bitget 표준 응답 파싱
         try:
             data = resp.json()
         except Exception:
@@ -128,7 +148,15 @@ class BitgetClient:
 
         code = str(data.get("code") or data.get("status") or "")
         if code not in ("00000", "0"):
-            # Bitget은 정상일 때 code=00000
+            # 40008: Request timestamp expired -> 시간 동기화 후 1회 재시도
+            if _retry_on_40008 and str(data).find("40008") != -1:
+                log.warning(f"Bitget 40008 detected, resyncing time and retrying once...")
+                try:
+                    self.sync_time()
+                except Exception as e:
+                    log.warning(f"time resync failed: {e}")
+                # 재시도
+                return self._request(method, path, params, body, _retry_on_40008=False)
             raise BitgetHTTPError(resp.status_code, data)
 
         return data
@@ -146,15 +174,9 @@ class BitgetClient:
         client_oid: str = "",
         price: Optional[float] = None,
     ) -> str:
-        """
-        시장가/지정가 주문.
-        - One-Way 모드 호환: holdSide 절대 전송 금지
-        - reduce_only=True면 전량/부분 청산용(시장가 권장)
-        """
         s = (side or "").lower().strip()
         if s not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
-
         ot = (order_type or "").lower().strip()
         if ot not in ("market", "limit"):
             raise ValueError("order_type must be 'market' or 'limit'")
@@ -162,10 +184,10 @@ class BitgetClient:
         path = "/api/mix/v1/order/placeOrder"
         body: Dict[str, Any] = {
             "symbol": symbol,
-            "productType": self.PRODUCT_TYPE,   # "umcbl"
-            "marginCoin": self.MARGIN_COIN,     # "USDT"
+            "productType": self.PRODUCT_TYPE,
+            "marginCoin": self.MARGIN_COIN,
             "size": str(size),
-            "side": s,                          # ✅ one-way: side만 사용
+            "side": s,                       # one-way: side만 사용
             "orderType": ot,
             "reduceOnly": bool(reduce_only),
         }
@@ -180,12 +202,6 @@ class BitgetClient:
         return order_id
 
     def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
-        """
-        서버에서 공통으로 부르는 헬퍼.
-        - 헷지 모드에선 long/short가 동시에 존재 가능
-        - 원웨이 모드에선 한 방향만 존재하지만, 인터페이스를 맞추기 위해
-          내부에서 long/short로 매핑해서 리턴한다.
-        """
         path = "/api/mix/v1/position/queryPosition"
         params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
         res = self._request("GET", path, params=params)
@@ -193,43 +209,26 @@ class BitgetClient:
 
         long_sz = 0.0
         short_sz = 0.0
-
-        # Bitget은 포지션 객체에 holdSide 혹은 side 비슷한 필드 제공
-        # one-way에서도 'holdSide'가 'long' 또는 'short'로 들어온다.
         for it in items:
             try:
                 hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
                 total = float(it.get("total") or it.get("available") or it.get("openAmount") or 0.0)
-                # 일부 응답 필드명은 시기마다 조금씩 다름. total/available 둘 다 시도.
             except Exception:
                 continue
-
             if hold_side == "long":
                 long_sz += total
             elif hold_side == "short":
                 short_sz += total
-            else:
-                # 혹시 모르는 경우: size 숫자와 avgOpenPrice 등으로 방향 추정
-                # openPrice/avgOpenPrice는 둘 다 존재 가능. 여기선 holdSide가 없으면 스킵.
-                pass
-
         return {"long": float(long_sz), "short": float(short_sz)}
 
     def get_avg_entry_price(self, symbol: str) -> float:
-        """
-        평균 진입가(보유중인 포지션 기준).
-        - one-way에선 현재 보유 방향의 avgOpenPrice를 반환.
-        - 양방향(헷지)이더라도 평균가가 존재하는 쪽을 우선 반환(단순화).
-        """
         path = "/api/mix/v1/position/queryPosition"
         params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
         res = self._request("GET", path, params=params)
         items = res.get("data") or []
 
-        # 우선 long 우선, 없으면 short
         long_price = None
         short_price = None
-
         for it in items:
             try:
                 hold_side = str(it.get("holdSide") or it.get("side") or "").lower()
@@ -237,10 +236,8 @@ class BitgetClient:
                 total = float(it.get("total") or 0.0)
             except Exception:
                 continue
-
             if total <= 0:
                 continue
-
             if hold_side == "long" and avg > 0:
                 long_price = avg
             elif hold_side == "short" and avg > 0:
@@ -251,7 +248,3 @@ class BitgetClient:
         if short_price:
             return float(short_price)
         return 0.0
-
-    # (선택) 취소/플랜주문 등은 필요 시 확장
-    # def cancel_order(self, symbol: str, order_id: str) -> bool: ...
-    # def place_tp_order(...): ...
