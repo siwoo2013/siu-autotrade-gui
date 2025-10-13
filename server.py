@@ -1,208 +1,252 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
-import traceback
-from typing import Dict, Any
+from typing import Any, Dict
 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from bitget_client import BitgetClient, BitgetHTTPError
+from bitget_client import BitgetClient
 
-import logging
-log = logging.getLogger("uvicorn.error")
+# =========================
+# ENV
+# =========================
+BITGET_API_KEY = os.environ.get("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.environ.get("BITGET_API_SECRET", "")
+BITGET_PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
+TRADE_MODE = os.environ.get("TRADE_MODE", "live")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
-# ============================ ENV ============================
-TRADE_MODE = (os.getenv("TRADE_MODE") or "live").lower()
-BITGET_API_KEY = os.getenv("BITGET_API_KEY") or ""
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET") or ""
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE") or ""
-WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+# =========================
+# APP / LOGGER
+# =========================
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
-# ============================ Bitget Client ============================
-# matches bitget_client.py signature: api_key, api_secret, passphrase, mode
+app = FastAPI()
+
+# =========================
+# BITGET CLIENT
+# =========================
 bg = BitgetClient(
     api_key=BITGET_API_KEY,
     api_secret=BITGET_API_SECRET,
     passphrase=BITGET_PASSPHRASE,
-    mode=TRADE_MODE,
-    timeout=10,
+    product_type="umcbl",
+    margin_coin="USDT",
+    logger=logger,
 )
 
-app = FastAPI(title="siu-autotrade-gui")
-
-# ============================ Utils ============================
-SYMBOL_MAP = {
-    "BTCUSDT.P": "BTCUSDT_UMCBL",
-    "BTCUSDT": "BTCUSDT_UMCBL",
-    "ETHUSDT.P": "ETHUSDT_UMCBL",
-    "ETHUSDT": "ETHUSDT_UMCBL",
-}
-def map_symbol(raw_symbol: str) -> str:
-    s = (raw_symbol or "").strip().upper()
-    if s in SYMBOL_MAP:
-        return SYMBOL_MAP[s]
+# =========================
+# UTILS
+# =========================
+def normalize_symbol(sym: str) -> str:
+    """
+    TV에서 올 수 있는 심볼을 Bitget UMCBL 표기로 통일
+    BTCUSDT.P -> BTCUSDT_UMCBL
+    BTCUSDT -> BTCUSDT_UMCBL
+    """
+    if not sym:
+        return "BTCUSDT_UMCBL"
+    s = sym.strip().upper()
+    if s.endswith("_UMCBL"):
+        return s
     if s.endswith(".P"):
-        return s.split(".")[0] + "_UMCBL"
-    if "_" not in s:
+        s = s[:-2]
+    if s.endswith("USDT"):
         return s + "_UMCBL"
     return s
 
-def ok(data: Dict[str, Any] = None, **kw):
-    d = {"ok": True}
-    if data:
-        d.update(data)
-    if kw:
-        d.update(kw)
-    return JSONResponse(d, status_code=200)
+_symbol_locks: dict[str, asyncio.Lock] = {}
 
-def err(msg: str, **kw):
-    d = {"ok": False, "error": msg}
-    if kw:
-        d.update(kw)
-    return JSONResponse(d, status_code=200)
 
-def auth_ok(payload: Dict[str, Any]) -> bool:
-    sec = (payload or {}).get("secret")
-    return (WEBHOOK_SECRET and sec == WEBHOOK_SECRET)
+def symbol_lock(symbol: str) -> asyncio.Lock:
+    if symbol not in _symbol_locks:
+        _symbol_locks[symbol] = asyncio.Lock()
+    return _symbol_locks[symbol]
 
-# ============================ Diagnostics ============================
+
+async def sleep_ms(ms: int):
+    await asyncio.sleep(ms / 1000.0)
+
+
+def _fmt_qty(q: float) -> str:
+    """
+    수량 문자열화(여유 있게 6자리). 비트겟이 허용 범위에서 라운딩.
+    """
+    txt = f"{q:.6f}"
+    return txt.rstrip("0").rstrip(".") if "." in txt else txt
+
+# =========================
+# CLOSE (확인 루프)
+# =========================
+async def ensure_close_full(symbol: str, side_to_close: str, *, max_retry: int = 10) -> Dict[str, Any]:
+    """
+    side_to_close: 'LONG' or 'SHORT'
+    - 포지션 조회 -> reduceOnly 시장가로 닫기 -> 0 확인
+    - 조회/주문 실패시 짧은 백오프로 재시도
+    - 끝까지 0이 안 되면 신규 오픈은 중단해야 하므로 ok=False로 반환
+    """
+    last_detail: Any = None
+    backoff = 0.30  # sec
+
+    for attempt in range(1, max_retry + 1):
+        # 포지션 조회 실패도 재시도
+        try:
+            sizes = bg.get_hedge_sizes(symbol)
+            long_sz = float(sizes["long"] or 0)
+            short_sz = float(sizes["short"] or 0)
+        except Exception as e:
+            logger.info("get_hedge_sizes failed (retrying) #%s %s: %r", attempt, symbol, e)
+            await sleep_ms(int(backoff * 1000))
+            backoff = min(backoff * 1.5, 1.2)
+            continue
+
+        logger.info(
+            "ensure_close_full #%s | %s sizes(long=%.6f, short=%.6f)",
+            attempt, symbol, long_sz, short_sz
+        )
+
+        try:
+            if side_to_close == "LONG":
+                if long_sz <= 0:
+                    return {"ok": True, "closed": {"skipped": True, "reason": "already_zero"}}
+                bg.close_long(symbol, size=_fmt_qty(long_sz))
+            else:
+                if short_sz <= 0:
+                    return {"ok": True, "closed": {"skipped": True, "reason": "already_zero"}}
+                bg.close_short(symbol, size=_fmt_qty(short_sz))
+        except requests.RequestException as e:
+            try:
+                last_detail = e.response.json()  # type: ignore
+            except Exception:
+                last_detail = {
+                    "raw": getattr(e, "response", None)
+                    and getattr(e.response, "text", "")
+                    or str(e)
+                }
+            logger.info("close attempt error (retrying): %s", last_detail)
+
+        # 체결 반영 대기 + 재확인
+        await sleep_ms(int(backoff * 1000))
+        try:
+            sizes2 = bg.get_hedge_sizes(symbol)
+            long2 = float(sizes2["long"] or 0)
+            short2 = float(sizes2["short"] or 0)
+        except Exception:
+            long2 = long_sz
+            short2 = short_sz
+
+        if side_to_close == "LONG" and long2 <= 0:
+            return {"ok": True, "closed": {"size_before": long_sz, "size_after": long2}}
+        if side_to_close == "SHORT" and short2 <= 0:
+            return {"ok": True, "closed": {"size_before": short_sz, "size_after": short2}}
+
+        backoff = min(backoff * 1.5, 1.2)
+
+    return {"ok": False, "error": "close_not_flat", "detail": last_detail}
+
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
-def root():
+def health() -> Dict[str, Any]:
     return {"ok": True, "service": "siu-autotrade-gui", "mode": TRADE_MODE}
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "siu-autotrade-gui", "mode": TRADE_MODE}
 
-@app.get("/__routes")
-def list_routes():
-    return {"ok": True, "routes": [r.path for r in app.routes]}
-
-@app.get("/mode")
-def get_mode():
-    try:
-        mode = bg.query_position_mode() if hasattr(bg, "query_position_mode") else "unknown"
-        return {"ok": True, "mode": mode}
-    except BitgetHTTPError as e:
-        return {"ok": False, "error": "bitget-http", "detail": str(e)}
-    except Exception as e:
-        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
-
-@app.get("/positions")
-def get_positions(symbol: str = "BTCUSDT.P"):
-    try:
-        sym = map_symbol(symbol)
-        sizes = bg.get_hedge_sizes(sym)  # {"long": x, "short": y}
-        return {"ok": True, "symbol": sym, "sizes": sizes}
-    except BitgetHTTPError as e:
-        return {"ok": False, "error": "bitget-http", "detail": str(e)}
-    except Exception as e:
-        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
-
-# ============================ Trading ============================
 @app.post("/tv")
 async def tv(request: Request):
+    # 0) JSON 파싱
     try:
+        payload = await request.json()
+    except Exception:
+        raw = await request.body()
         try:
-            payload = await request.json()
+            payload = json.loads(raw.decode("utf-8"))
         except Exception:
-            body = await request.body()
-            log.error(f"Invalid JSON body: {body[:200]}")
-            return err("invalid-json")
+            return JSONResponse({"ok": False, "error": "bad-json"}, status_code=400)
 
-        if not auth_ok(payload):
-            return err("unauthorized")
+    # 1) 인증
+    if str(payload.get("secret")) != str(WEBHOOK_SECRET):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-        route = (payload.get("route") or "").strip()
-        target_side = (payload.get("target") or payload.get("target_side") or "").upper().strip()
-        raw_symbol = payload.get("symbol") or payload.get("ticker") or ""
-        symbol = map_symbol(raw_symbol)
-        size = float(payload.get("size") or payload.get("qty") or 0)
-        otype = (payload.get("type") or "MARKET").upper()
+    # 2) 필드
+    route = str(payload.get("route", "")).strip()
+    exchange = str(payload.get("exchange", "bitget")).lower()
+    raw_symbol = str(payload.get("symbol", "BTCUSDT_UMCBL")).strip()
+    symbol = normalize_symbol(raw_symbol)
+    target_side = str(payload.get("target_side", "")).upper()  # BUY / SELL
+    order_type = str(payload.get("type", "MARKET")).lower()
+    size = str(payload.get("size", "0.001"))
 
-        log.info(f"[TV] route={route} symbol={symbol} target={target_side} size={size} type={otype}")
-        if otype != "MARKET":
-            return err("only-market-supported")
+    if exchange != "bitget":
+        return JSONResponse({"ok": False, "error": "unsupported-exchange"}, status_code=400)
 
-        # 신규 오픈
+    logger.info(
+        "[LIVE] [TV] 수신 | raw=%s -> %s | %s | %s | size=%s",
+        raw_symbol, symbol, route, target_side, size
+    )
+
+    # 심볼별 직렬화
+    async with symbol_lock(symbol):
+
         if route == "order.open":
-            if size <= 0:
-                return err("invalid-size")
-            open_side = "buy" if target_side == "BUY" else "sell"
-            oid = bg.place_order(symbol=symbol, side=open_side,
-                                 order_type="market", size=size, reduce_only=False,
-                                 client_oid=f"tv-open-{target_side.lower()}")
-            return ok(route=route, opened={"orderId": oid, "side": target_side, "size": size})
+            try:
+                if target_side == "BUY":
+                    res = bg.open_long(symbol, size, order_type)
+                elif target_side == "SELL":
+                    res = bg.open_short(symbol, size, order_type)
+                else:
+                    return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
+                return {"ok": True, "result": res}
+            except requests.HTTPError as e:
+                try:
+                    detail = e.response.json()
+                except Exception:
+                    detail = {"raw": getattr(e.response, "text", "")}
+                return JSONResponse(
+                    {"ok": False, "error": "bitget-http", "status": getattr(e.response, "status_code", None), "detail": detail},
+                    status_code=500,
+                )
 
-        # 리버스
-        elif route == "order.reverse":
-            if size <= 0 or target_side not in ("BUY", "SELL"):
-                return err("invalid-params")
+        if route == "order.reverse":
+            try:
+                if target_side == "BUY":
+                    close_res = await ensure_close_full(symbol, "SHORT")  # 숏 전량 청산
+                    if not close_res.get("ok"):
+                        logger.error("reverse abort: SHORT close failed: %s", close_res)
+                        return JSONResponse({"ok": False, "error": "close-failed", "detail": close_res}, status_code=500)
+                    open_res = bg.open_long(symbol, size, order_type)
 
-            sizes = bg.get_hedge_sizes(symbol)
-            long_sz = float(sizes.get("long") or 0.0)
-            short_sz = float(sizes.get("short") or 0.0)
+                elif target_side == "SELL":
+                    close_res = await ensure_close_full(symbol, "LONG")   # 롱 전량 청산
+                    if not close_res.get("ok"):
+                        logger.error("reverse abort: LONG close failed: %s", close_res)
+                        return JSONResponse({"ok": False, "error": "close-failed", "detail": close_res}, status_code=500)
+                    open_res = bg.open_short(symbol, size, order_type)
 
-            if long_sz == 0.0 and short_sz == 0.0:
-                open_side = "buy" if target_side == "BUY" else "sell"
-                oid = bg.place_order(symbol=symbol, side=open_side,
-                                     order_type="market", size=size, reduce_only=False,
-                                     client_oid=f"tv-rev-open-{target_side.lower()}")
-                return ok(route=route, action="reverse-flat->open",
-                          opened={"orderId": oid, "side": target_side, "size": size})
+                else:
+                    return JSONResponse({"ok": False, "error": "bad-target-side"}, status_code=400)
 
-            if target_side == "SELL":  # 롱 청산 → 잔량 숏 오픈
-                close_qty = min(size, long_sz)
-                closed = None
-                if long_sz > 0:
-                    cid = bg.place_order(symbol=symbol, side="sell",
-                                         order_type="market", size=close_qty, reduce_only=True,
-                                         client_oid="tv-rev-close-long")
-                    closed = {"closed_long": close_qty, "orderId": cid}
-                remain = size - close_qty
-                opened = None
-                if remain > 0:
-                    oid = bg.place_order(symbol=symbol, side="sell",
-                                         order_type="market", size=remain, reduce_only=False,
-                                         client_oid="tv-rev-open-sell-remain")
-                    opened = {"orderId": oid, "side": "SELL", "size": remain}
-                return ok(route=route, closed=closed, opened=opened)
+                return {"ok": True, "closed": close_res, "opened": open_res}
 
-            elif target_side == "BUY":  # 숏 청산 → 잔량 롱 오픈
-                close_qty = min(size, short_sz)
-                closed = None
-                if short_sz > 0:
-                    cid = bg.place_order(symbol=symbol, side="buy",
-                                         order_type="market", size=close_qty, reduce_only=True,
-                                         client_oid="tv-rev-close-short")
-                    closed = {"closed_short": close_qty, "orderId": cid}
-                remain = size - close_qty
-                opened = None
-                if remain > 0:
-                    oid = bg.place_order(symbol=symbol, side="buy",
-                                         order_type="market", size=remain, reduce_only=False,
-                                         client_oid="tv-rev-open-buy-remain")
-                    opened = {"orderId": oid, "side": "BUY", "size": remain}
-                return ok(route=route, closed=closed, opened=opened)
+            except requests.HTTPError as e:
+                try:
+                    detail = e.response.json()
+                except Exception:
+                    detail = {"raw": getattr(e.response, "text", "")}
+                logger.error("HTTPError during reverse: %s", detail)
+                return JSONResponse(
+                    {"ok": False, "error": "bitget-http", "status": getattr(e.response, "status_code", None), "detail": detail},
+                    status_code=500,
+                )
+            except Exception as e:  # 네트워크/파싱 예외 등
+                logger.exception("Exception in /tv reverse: %r", e)
+                return JSONResponse({"ok": False, "error": "exception", "detail": str(e)}, status_code=500)
 
-            return err("unhandled-reverse-branch")
-
-        else:
-            return err(f"unknown-route: {route}")
-
-    except BitgetHTTPError as e:
-        log.error(f"BitgetHTTPError: {e}")
-        return err("bitget-http", detail=str(e))
-    except Exception as e:
-        log.error(f"Exception in /tv: {e}\n{traceback.format_exc()}")
-        return err(type(e).__name__, detail=str(e))
-
-# ============================ Startup ============================
-@app.on_event("startup")
-async def _startup():
-    try:
-        if hasattr(bg, "ensure_unilateral_mode"):
-            mode = bg.ensure_unilateral_mode()
-            log.info(f"[startup] ensured unilateral mode -> {mode}")
-    except Exception as e:
-        log.warning(f"[startup] ensure_unilateral_mode skipped: {e}")
+        return JSONResponse({"ok": False, "error": "unsupported-route"}, status_code=400)
