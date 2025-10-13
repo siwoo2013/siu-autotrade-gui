@@ -1,173 +1,280 @@
 import os
+import json
+import math
 import time
-import uuid
-import logging
-from typing import Any, Dict, Optional
+import traceback
+from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import uvicorn
 
 from bitget_client import BitgetClient, BitgetHTTPError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("siu")
+SERVICE_NAME = "siu-autotrade-gui"
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-strong-secret").strip()
+TRADE_MODE = os.getenv("TRADE_MODE", "live").strip().lower()  # "live" | "paper"
+TP_PERCENT = float(os.getenv("TP_PERCENT", "7"))  # 체결 후 TP % (수익률 기준)
 
 app = FastAPI()
 
-# ---------------------------------------------------------------------
-# 환경변수
-# ---------------------------------------------------------------------
-API_KEY = os.getenv("BITGET_API_KEY", "")
-API_SECRET = os.getenv("BITGET_API_SECRET", "")
-API_PASS = os.getenv("BITGET_PASSPHRASE", "")
-TRADE_MODE = os.getenv("TRADE_MODE", "live")  # "live" | "paper"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-strong-secret")
+# -------------------------------
+# Bitget Client
+# -------------------------------
+bg = BitgetClient(
+    api_key=os.getenv("BITGET_API_KEY", ""),
+    api_secret=os.getenv("BITGET_API_SECRET", ""),
+    passphrase=os.getenv("BITGET_PASSPHRASE", ""),
+    mode=TRADE_MODE,
+)
 
-# TP 설정 (퍼센트), 예: 0.07 => +7%
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.07"))
+# -------------------------------
+# Symbol mapping
+# -------------------------------
+TV_SYMBOL_MAP = {
+    # 필요한 심볼은 계속 추가
+    "BTCUSDT.P": "BTCUSDT_UMCBL",
+    "ETHUSDT.P": "ETHUSDT_UMCBL",
+    "BTCUSD.P": "BTCUSD_UMCBL",
+    "ETHUSD.P": "ETHUSD_UMCBL",
+}
 
-bg = BitgetClient(API_KEY, API_SECRET, API_PASS)
-
-
-# ---------------------------------------------------------------------
-# 유틸
-# ---------------------------------------------------------------------
-def ok(**kw):
-    return JSONResponse({"ok": True, **kw})
-
-
-def fail(error: str, **kw):
-    return JSONResponse({"ok": False, "error": error, **kw})
-
-
-async def ensure_close_full(symbol: str, close_side: str) -> Dict[str, Any]:
+def normalize_tv_symbol(raw_symbol: str) -> str:
     """
-    close_side: "LONG" 또는 "SHORT" (해당 보유 방향을 전량 청산)
-    - 포지션 사이즈 조회 실패시 400이 날 수 있어 재시도 백오프 적용
+    TradingView에서 오는 심볼을 Bitget REST 심볼로 변환.
+    - 공백/프리픽스 제거 (예: BINANCE:BTCUSDT.P → BTCUSDT.P)
+    - 사전에 있으면 매핑 사용
+    - .P 로 끝나면 _UMCBL 로 강제 변환(안전장치)
     """
-    close_side = close_side.upper()
-    assert close_side in ("LONG", "SHORT")
+    s = (raw_symbol or "").strip().upper()
+    # 프리픽스 제거 (BINANCE:BTCUSDT.P -> BTCUSDT.P)
+    if ":" in s:
+        s = s.split(":", 1)[1]
 
-    # 사이즈 조회
-    retry = 0
-    while True:
+    if s in TV_SYMBOL_MAP:
+        return TV_SYMBOL_MAP[s]
+
+    if s.endswith(".P"):
+        base = s[:-2]  # ".P" 제거
+        return f"{base}_UMCBL"
+
+    # 이미 UMCBL로 온다면 그대로 사용
+    if s.endswith("_UMCBL") or s.endswith("_DMCBL") or s.endswith("_CMCBL"):
+        return s
+
+    # fallback: 그대로(로그에서 확인용)
+    return s
+
+
+# -------------------------------
+# Helpers
+# -------------------------------
+def ok(data: Dict[str, Any]) -> JSONResponse:
+    return JSONResponse({"ok": True, **data})
+
+def err(msg: str, **extra) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": msg, **extra})
+
+def side_to_hedge_flag(side: str) -> str:
+    """
+    내부 표준 방향 → Bitget hedge 방향 문자열
+    - "LONG"  → "long"
+    - "SHORT" → "short"
+    """
+    s = side.strip().upper()
+    if s == "LONG":
+        return "long"
+    if s == "SHORT":
+        return "short"
+    return s.lower()
+
+
+# -------------------------------
+# Ensure close-all for a hedge side
+# -------------------------------
+async def ensure_close_full(symbol: str, hedge_side: str) -> Dict[str, Any]:
+    """
+    헷지모드 기준 전량청산:
+      - 현재 포지션 크기 조회
+      - 남은 수량이 있으면 reduceOnly Market으로 한 번에 닫기
+    """
+    hflag = side_to_hedge_flag(hedge_side)
+    # 재시도(네트워크/서명에러 방어)
+    last_exc = None
+    for i in range(1, 5):
         try:
-            long_sz, short_sz = bg.get_hedge_sizes(symbol)
-            log.info(f"ensure_close_full #{retry+1} | {symbol} sizes(long={long_sz:.6f}, short={short_sz:.6f})")
+            sizes = bg.get_hedge_sizes(symbol)  # {"long": 0.0, "short": 0.0}
             break
-        except BitgetHTTPError as e:
-            retry += 1
-            if retry >= 10:
-                log.error(f"get_hedge_sizes failed 10/10 {symbol}: {e}")
-                raise
-            log.info(f"get_hedge_sizes failed (retrying) #{retry} {symbol}: {e}")
-            time.sleep(0.2 + 0.1 * retry)
+        except Exception as e:
+            last_exc = e
+            app.logger.info(f"ensure_close_full retry #{i} | {symbol} sizes fetch failed: {e}")
+            time.sleep(0.25)
+    else:
+        raise last_exc or RuntimeError("sizes fetch failed")
 
-    if close_side == "LONG" and long_sz > 0:
-        return bg.close_all(symbol, "long")
-    if close_side == "SHORT" and short_sz > 0:
-        return bg.close_all(symbol, "short")
-    # 닫을 게 없으면 스킵
-    return {"skipped": True, "detail": "No position to close"}
+    long_sz = float(sizes.get("long") or 0.0)
+    short_sz = float(sizes.get("short") or 0.0)
+    app.logger.info(f"ensure_close_full #1 | {symbol} sizes(long={long_sz:.6f}, short={short_sz:.6f})")
+
+    remain = long_sz if hflag == "long" else short_sz
+    if remain <= 0:
+        return {"closed": {"skipped": True, "size": 0}}
+
+    # reduceOnly 로 전량 청산
+    side_for_close = "sell" if hflag == "long" else "buy"
+    try:
+        order_id = bg.place_order(
+            symbol=symbol,
+            side=side_for_close,          # 반대 사이드로 체결
+            order_type="market",
+            size=remain,
+            reduce_only=True,             # 핵심: 청산
+            client_oid=f"tv-{int(time.time()*1000)}-close"
+        )
+        return {"closed": {"skipped": False, "size": remain, "orderId": order_id}}
+    except Exception as e:
+        app.logger.error(f"EA close failed {symbol} {hflag}: {e}")
+        raise
 
 
-# ---------------------------------------------------------------------
-# 라우트
-# ---------------------------------------------------------------------
+def _tp_price_after_fill(avg_price: float, side: str, tp_percent: float) -> float:
+    """
+    체결가 기준 TP 목표가 계산 (수익률 % 기준)
+     - LONG: avg * (1 + p/100)
+     - SHORT: avg * (1 - p/100)
+    """
+    p = abs(tp_percent) / 100.0
+    if side.upper() == "BUY":   # LONG 오픈
+        return avg_price * (1.0 + p)
+    else:                       # SELL 오픈 → SHORT
+        return avg_price * (1.0 - p)
+
+
+def set_tp_percent(symbol: str, side: str, tp_percent: float, position_size: float) -> Optional[Dict[str, Any]]:
+    """
+    포지션 진입 후, 현재 평균 진입가 조회 → TP 주문(감시/시장) 등록.
+    Bitget는 바로 %지정 불가라 가격 계산해서 넣어야 함.
+    """
+    try:
+        avg = bg.get_avg_entry_price(symbol)
+        tp_price = _tp_price_after_fill(avg, side, tp_percent)
+
+        # take-profit은 reduceOnly=True 로, 반대 방향으로 트리거/시장(TP) 등록
+        tp_side = "sell" if side.upper() == "BUY" else "buy"
+        tp_oid = bg.place_tp_order(
+            symbol=symbol,
+            side=tp_side,
+            trigger_price=tp_price,
+            size=position_size
+        )
+        return {"avg": avg, "tp_price": tp_price, "tp_order_id": tp_oid}
+    except Exception as e:
+        app.logger.warning(f"set_tp_percent failed: {e}")
+        return None
+
+
+# -------------------------------
+# Routes
+# -------------------------------
 @app.get("/")
-async def health():
-    return {"ok": True, "service": "siu-autotrade-gui", "mode": TRADE_MODE}
-
+def health():
+    return {"ok": True, "service": SERVICE_NAME, "mode": TRADE_MODE}
 
 @app.post("/tv")
 async def tv(request: Request):
     """
-    TradingView → webhook 진입점
-    payload 예:
-      {
-        "secret": "your-strong-secret",
-        "route": "order.reverse",    // 또는 "order.open"
-        "exchange": "bitget",
-        "symbol": "BTCUSDT_UMCBL",
-        "target_side": "BUY" | "SELL",
-        "type": "MARKET",
-        "size": "0.001"
-      }
+    Webhook 엔드포인트
+    JSON payload 예:
+    {
+      "secret": "your-strong-secret",
+      "route": "order.reverse",
+      "exchange": "bitget",
+      "symbol": "{{ticker}}",               // ex) BTCUSDT.P
+      "target_side": "BUY" | "SELL",        // 반대 신호
+      "type": "MARKET",
+      "size": 0.001
+    }
     """
-    payload = await request.json()
-    if payload.get("secret") != WEBHOOK_SECRET:
-        return fail("unauthorized")
-
-    # 공통 파라미터
-    route = payload.get("route") or ""
-    symbol = payload.get("symbol") or "BTCUSDT_UMCBL"
-    tgt_side = (payload.get("target_side") or "").upper()  # BUY/SELL
-    otype = (payload.get("type") or "MARKET").lower()
     try:
-        size = float(str(payload.get("size", "0.001")))
+        body = await request.body()
+        data = json.loads(body.decode("utf-8"))
     except Exception:
-        size = 0.001
+        return err("invalid-json")
 
-    log.info(f"[LIVE] [TV] 수신 | raw={payload.get('symbol')} -> symbol={symbol} | {route} | {tgt_side} | size={size:.6f}")
+    if str(data.get("secret", "")).strip() != WEBHOOK_SECRET:
+        return err("unauthorized")
 
-    # ---------------------------------------------
-    # order.open : 단순 신규 (헤지모드 유지)
-    # ---------------------------------------------
-    if route == "order.open":
+    route = str(data.get("route", "")).strip()
+    exchange = str(data.get("exchange", "bitget")).strip().lower()
+    raw_symbol = str(data.get("symbol", "")).strip()
+
+    # ★★ 핵심: TV심볼 → Bitget 심볼 매핑
+    symbol = normalize_tv_symbol(raw_symbol)
+
+    target_side = str(data.get("target_side", "")).strip().upper()  # BUY/SELL
+    order_type = str(data.get("type", "MARKET")).strip().upper()
+    size = float(data.get("size", 0) or 0)
+
+    app.logger.info(f"[LIVE] [TV] 수신 | raw={raw_symbol} -> symbol={symbol} | {route} | {target_side} | size={size:.6f}")
+
+    if exchange != "bitget":
+        return err("unsupported-exchange")
+
+    if route != "order.reverse":
+        return err("unsupported-route", route=route)
+
+    # ===== EA 스타일: 먼저 반대 포지션 전량 청산 후, 신규 오픈 =====
+    # 1) 청산
+    close_hedge = "SHORT" if target_side == "BUY" else "LONG"
+    try:
+        close_res = await ensure_close_full(symbol, close_hedge)
+    except Exception as e:
+        app.logger.error(f"Exception in /tv reverse(close): {e}")
+        return err("reverse-close-failed", detail=str(e))
+
+    # 2) 신규 오픈
+    side_for_open = "buy" if target_side == "BUY" else "sell"
+    try:
+        oid = bg.place_order(
+            symbol=symbol,
+            side=side_for_open,
+            order_type=order_type.lower(),
+            size=size,
+            reduce_only=False,
+            client_oid=f"tv-{int(time.time()*1000)}-open"
+        )
+    except BitgetHTTPError as e:
+        # 종종 400/시그니처/네트워크 오류 → 아주 간단 재시도
+        app.logger.warning(f"open order first failed({e}); retrying once…")
         try:
-            # BUY는 롱 오픈, SELL은 숏 오픈
-            side = "buy" if tgt_side == "BUY" else "sell"
-            cid = f"tv-{uuid.uuid4().hex[:8]}-open"
-            res = bg.place_order(symbol, side=side, size=size, order_type=otype, reduce_only=False, client_oid=cid)
-            log.info(f"open: {side} size={size} -> {res}")
+            time.sleep(0.2)
+            oid = bg.place_order(
+                symbol=symbol,
+                side=side_for_open,
+                order_type=order_type.lower(),
+                size=size,
+                reduce_only=False,
+                client_oid=f"tv-{int(time.time()*1000)}-open-h"
+            )
+        except Exception as e2:
+            app.logger.error(f"Exception in /tv reverse(open): {e2}")
+            return err("reverse-open-failed", detail=str(e2))
 
-            # TP(익절) 7% 등록(주문 체결 직후 포지션 기준)
-            hold = "long" if tgt_side == "BUY" else "short"
-            try:
-                tp_res = bg.set_tp_percent(symbol, hold_side=hold, percent=TP_PERCENT)
-                log.info(f"place TP {TP_PERCENT*100:.1f}% {hold}: {tp_res}")
-            except BitgetHTTPError as e:
-                log.warning(f"TP place skipped: {e}")
+    # 3) TP(수익률 %) 등록 (실패해도 주문은 성공이므로 경고만)
+    tp_info = set_tp_percent(symbol, target_side, TP_PERCENT, position_size=size)
 
-            return ok(service="siu-autotrade-gui", mode=TRADE_MODE, opened=res)
-        except BitgetHTTPError as e:
-            return fail("bitget-http", detail=str(e))
+    return ok({
+        "route": route,
+        "symbol": symbol,
+        "target_side": target_side,
+        "size": size,
+        "closed": close_res.get("closed", {}),
+        "opened": {"orderId": oid},
+        "tp": tp_info or {"skipped": True},
+    })
 
-    # ---------------------------------------------
-    # order.reverse : 반대 방향으로 전환
-    #  - 현재 보유 반대편 전량 청산 → 신규 반대 오픈 → TP등록
-    # ---------------------------------------------
-    if route == "order.reverse":
-        if tgt_side not in ("BUY", "SELL"):
-            return fail("bad-request", detail="target_side must be BUY or SELL")
-        try:
-            # 1) 반대편 청산
-            if tgt_side == "BUY":
-                close_res = await ensure_close_full(symbol, "SHORT")
-            else:
-                close_res = await ensure_close_full(symbol, "LONG")
-        except BitgetHTTPError as e:
-            log.error(f"Exception in /tv reverse: {e}")
-            return fail("bitget-http", detail=str(e))
 
-        # 2) 신규 오픈
-        try:
-            side = "buy" if tgt_side == "BUY" else "sell"
-            cid = f"tv-{uuid.uuid4().hex[:8]}-rev-open"
-            open_res = bg.place_order(symbol, side=side, size=size, order_type=otype, reduce_only=False, client_oid=cid)
-            log.info(f"reverse: open | {side} size={size} -> {open_res}")
-        except BitgetHTTPError as e:
-            return fail("bitget-http", detail=str(e), closed=close_res)
-
-        # 3) TP 등록 (포지션 기준 7%)
-        hold = "long" if tgt_side == "BUY" else "short"
-        try:
-            tp_res = bg.set_tp_percent(symbol, hold_side=hold, percent=TP_PERCENT)
-            log.info(f"place TP {TP_PERCENT*100:.1f}% {hold}: {tp_res}")
-        except BitgetHTTPError as e:
-            log.warning(f"TP place skipped: {e}")
-            tp_res = None
-
-        return ok(service="siu-autotrade-gui", mode=TRADE_MODE, closed=close_res, opened=open_res, tp=tp_res)
-
-    return fail("unknown-route", detail=route)
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
