@@ -15,15 +15,23 @@ from requests.exceptions import ConnectionError, Timeout
 from urllib3.exceptions import ProtocolError
 
 
+class BitgetHTTPError(Exception):
+    def __init__(self, status: int, body: str):
+        super().__init__(f"bitget-http status={status} body={body}")
+        self.status = status
+        self.body = body
+
+
 class BitgetClient:
     """
-    Bitget Mix (UMCBL) REST client (sign-type=2, HMAC base64).
-    - _request: 일시 오류 재시도(지수 백오프)
-    - get_hedge_sizes / get_hedge_detail / get_last_price 제공
+    Bitget Mix (UMCBL) REST client
+    - Sign: Base64(HMAC-SHA256(timestamp + method + path + body))
+    - Robust retry for transient network issues
+    - Helpers: ticker, positions(hedge detail), orders
     """
 
     BASE_URL = "https://api.bitget.com"
-    SIGN_TYPE = "2"  # HMAC-SHA256 + base64
+    SIGN_TYPE = "2"  # HMAC-SHA256 base64
 
     def __init__(
         self,
@@ -38,26 +46,23 @@ class BitgetClient:
     ) -> None:
         if not api_key or not api_secret or not passphrase:
             raise ValueError("Bitget keys missing")
-
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
         self.product_type = product_type
         self.margin_coin = margin_coin
         self.timeout = timeout
-
         self.session = requests.Session()
         self.log = logger or logging.getLogger("bitget")
 
-    # ---------------- internal helpers ---------------- #
-
-    def _timestamp_ms(self) -> str:
+    # --------- internal --------- #
+    def _ts(self) -> str:
         return str(int(time.time() * 1000))
 
-    def _sign(self, ts: str, method: str, path_with_query: str, body: str) -> str:
-        msg = (ts + method.upper() + path_with_query + body).encode("utf-8")
-        digest = hmac.new(self.api_secret.encode("utf-8"), msg, hashlib.sha256).digest()
-        return base64.b64encode(digest).decode("utf-8")
+    def _sign(self, ts: str, method: str, path_with_qs: str, body: str) -> str:
+        msg = (ts + method.upper() + path_with_qs + body).encode("utf-8")
+        dig = hmac.new(self.api_secret.encode("utf-8"), msg, hashlib.sha256).digest()
+        return base64.b64encode(dig).decode("utf-8")
 
     def _request(
         self,
@@ -68,29 +73,22 @@ class BitgetClient:
         *,
         max_retry: int = 4,
     ) -> Dict[str, Any]:
-        """
-        네트워크/일시 오류에 대해 재시도(백오프)한다.
-        성공 2xx면 JSON 반환, 그렇지 않으면 raise_for_status.
-        """
         m = method.upper()
-        query = ""
+        params = params or {}
+        body = body or {}
+        qs = ""
         if m == "GET" and params:
-            ordered: List[Tuple[str, Any]] = [(k, params[k]) for k in sorted(params.keys())]
-            query = "?" + urlencode(ordered)
+            parts = [(k, params[k]) for k in sorted(params.keys())]
+            qs = "?" + urlencode(parts)
 
-        url = self.BASE_URL + path + query
+        url = self.BASE_URL + path + qs
+        body_str = "" if m == "GET" else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        # body
-        raw_body = ""
-        if m != "GET" and body:
-            raw_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-
-        backoff = 0.25  # sec
+        backoff = 0.25
         last_exc: Optional[Exception] = None
-
-        for attempt in range(1, max_retry + 1):
-            ts = self._timestamp_ms()
-            sign = self._sign(ts, m, path + query, raw_body)
+        for _try in range(1, max_retry + 1):
+            ts = self._ts()
+            sign = self._sign(ts, m, path + qs, body_str)
             headers = {
                 "ACCESS-KEY": self.api_key,
                 "ACCESS-PASSPHRASE": self.passphrase,
@@ -98,58 +96,41 @@ class BitgetClient:
                 "ACCESS-TIMESTAMP": ts,
                 "ACCESS-SIGN": sign,
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Connection": "close",
             }
-
             try:
                 resp = self.session.request(
-                    method=m,
-                    url=url,
+                    m,
+                    url,
                     headers=headers,
-                    data=raw_body if m != "GET" else None,
+                    data=body_str if m != "GET" else None,
                     timeout=self.timeout,
                 )
-                # 정상
                 if 200 <= resp.status_code < 300:
                     return resp.json()
-
-                # 오류 바디 로깅
-                level = "error"
                 try:
                     payload = resp.json()
-                    code = str(payload.get("code"))
-                    if code in {"22002", "400172"}:  # not position / side mismatch 등은 info
-                        level = "info"
                 except Exception:
                     payload = {"raw": resp.text}
-
-                log_fn = self.log.info if level == "info" else self.log.error
-                log_fn("Bitget HTTP %s %s -> %s | url=%s | body=%s",
-                       m, path, resp.status_code, resp.url, raw_body or "")
-                log_fn("Bitget response: %s", payload)
-
+                self.log.error("Bitget HTTP %s %s -> %s | %s", m, path, resp.status_code, payload)
                 resp.raise_for_status()
-
             except (ConnectionError, Timeout, ProtocolError) as e:
                 last_exc = e
-                self.log.warning("Bitget request retry %s/%s (%s) %s %s",
-                                 attempt, max_retry, type(e).__name__, m, path)
+                self.log.warning("retry %s %s %s: %s", _try, m, path, e)
                 time.sleep(backoff)
-                backoff = min(backoff * 2.0, 1.5)
+                backoff = min(backoff * 1.5, 1.2)
                 continue
 
-        # 재시도 실패
         if last_exc:
             raise last_exc
-        raise RuntimeError("Bitget request failed without response")
+        raise RuntimeError("Bitget request failed")
 
-    # ---------------- market ---------------- #
-
+    # --------- market --------- #
     def get_last_price(self, symbol: str) -> float:
-        """현재가(틱커)"""
         res = self._request("GET", "/api/mix/v1/market/ticker", params={"symbol": symbol})
         data = res.get("data", {}) or {}
-        # price 키가 region/버전에 따라 다를 수 있어 가능한 후보를 사용
-        for k in ("last", "lastPrice", "close", "closePrice"):
+        for k in ("last", "lastPrice", "close", "closePrice", "markPrice"):
             v = data.get(k)
             if v is not None:
                 try:
@@ -158,73 +139,66 @@ class BitgetClient:
                     pass
         raise RuntimeError(f"ticker parse failed: {data}")
 
-    # ---------------- positions ---------------- #
-
+    # --------- positions (hedge) --------- #
     def get_hedge_detail(self, symbol: str) -> Dict[str, Dict[str, float]]:
         """
-        현재 심볼의 롱/숏 {size, avgPrice} 조회 (hedge 모드 기준).
-        return {"long": {"size": float, "avg": float}, "short": {...}}
+        return:
+        {
+          "long": {"size": float, "avg": float, "margin": float, "pnl": float, "lev": float},
+          "short":{"size": float, "avg": float, "margin": float, "pnl": float, "lev": float}
+        }
         """
         path = "/api/mix/v1/position/singlePosition"
         params = {"symbol": symbol, "marginCoin": self.margin_coin}
         res = self._request("GET", path, params=params)
-
         data = res.get("data", {})
-        long_size = short_size = 0.0
-        long_avg = short_avg = 0.0
+        out = {
+            "long": {"size": 0.0, "avg": 0.0, "margin": 0.0, "pnl": 0.0, "lev": 0.0},
+            "short": {"size": 0.0, "avg": 0.0, "margin": 0.0, "pnl": 0.0, "lev": 0.0},
+        }
 
-        # dict(total/long/short) 형식
+        def fill(dst: Dict[str, float], node: Dict[str, Any]):
+            def fget(keys: List[str], cast=float, default=0.0):
+                for k in keys:
+                    if k in node and node[k] is not None:
+                        try:
+                            return cast(node[k])
+                        except Exception:
+                            pass
+                return default
+
+            dst["size"] = fget(["total", "totalSize", "available", "availableSize"])
+            dst["avg"] = fget(["averageOpenPrice", "avgOpenPrice"])
+            dst["margin"] = fget(["margin", "marginAmount"])
+            dst["pnl"] = fget(["unrealizedPL", "unrealizedPnl", "profit", "upl"])
+            dst["lev"] = fget(["leverage"], cast=float) or fget(["leverage"], cast=int)
+
         if isinstance(data, dict):
-            long_node = data.get("long") or {}
-            short_node = data.get("short") or {}
-            try:
-                long_size = float(long_node.get("total", 0) or long_node.get("available", 0) or 0)
-            except Exception:
-                pass
-            try:
-                short_size = float(short_node.get("total", 0) or short_node.get("available", 0) or 0)
-            except Exception:
-                pass
-            try:
-                long_avg = float(long_node.get("averageOpenPrice", 0) or long_node.get("avgOpenPrice", 0) or 0)
-            except Exception:
-                pass
-            try:
-                short_avg = float(short_node.get("averageOpenPrice", 0) or short_node.get("avgOpenPrice", 0) or 0)
-            except Exception:
-                pass
-
-        # list(레그별) 형식
-        elif isinstance(data, list):
+            l = data.get("long") or {}
+            s = data.get("short") or {}
+            fill(out["long"], l)
+            fill(out["short"], s)
+        elif isinstance(data, list):  # some regions return list
             for p in data:
                 if not isinstance(p, dict):
                     continue
                 side = (p.get("holdSide") or p.get("side") or "").lower()
-                size = p.get("total") or p.get("totalSize") or p.get("available") or p.get("availableSize") or 0
-                avg = p.get("averageOpenPrice") or p.get("avgOpenPrice") or 0
-                try:
-                    fsize = float(size or 0)
-                except Exception:
-                    fsize = 0.0
-                try:
-                    favg = float(avg or 0)
-                except Exception:
-                    favg = 0.0
-
+                node = {}
+                # normalize keys
+                for k in p.keys():
+                    node[k] = p[k]
                 if side.startswith("long"):
-                    long_size += fsize
-                    long_avg = favg or long_avg
+                    fill(out["long"], node)
                 elif side.startswith("short"):
-                    short_size += fsize
-                    short_avg = favg or short_avg
+                    fill(out["short"], node)
 
-        return {"long": {"size": long_size, "avg": long_avg}, "short": {"size": short_size, "avg": short_avg}}
+        return out
 
     def get_hedge_sizes(self, symbol: str) -> Dict[str, float]:
         d = self.get_hedge_detail(symbol)
         return {"long": d["long"]["size"], "short": d["short"]["size"]}
 
-    # ---- hedge helpers ----
+    # --------- order helpers (hedge-aware sides) --------- #
     @staticmethod
     def _map_side_for_hedge(logical_side: str, reduce_only: bool) -> str:
         s = logical_side.lower()
@@ -232,7 +206,7 @@ class BitgetClient:
             return "open_long" if s == "buy" else "open_short"
         return "close_short" if s == "buy" else "close_long"
 
-    def _send_place_order(
+    def _place(
         self,
         *,
         tv_symbol: str,
@@ -240,66 +214,46 @@ class BitgetClient:
         order_type: str,
         size: str,
         reduce_only: bool,
-        client_oid: Optional[str],
-        price: Optional[str],
-        time_in_force: Optional[str],
+        client_oid: Optional[str] = None,
+        price: Optional[str] = None,
+        tif: Optional[str] = None,
     ) -> Dict[str, Any]:
-        path = "/api/mix/v1/order/placeOrder"
-        body: Dict[str, Any] = {
+        body = {
             "symbol": tv_symbol,
             "marginCoin": self.margin_coin,
             "productType": self.product_type,
-            "side": side,
+            "side": self._map_side_for_hedge(side, reduce_only),
             "orderType": order_type.lower(),
             "size": str(size),
             "reduceOnly": bool(reduce_only),
         }
         if client_oid:
             body["clientOid"] = client_oid
-        if price and order_type.lower() == "limit":
+        if price and body["orderType"] == "limit":
             body["price"] = str(price)
-        if time_in_force:
-            body["timeInForceValue"] = time_in_force
-        return self._request("POST", path, body=body)
+        if tif:
+            body["timeInForceValue"] = tif
+        return self._request("POST", "/api/mix/v1/order/placeOrder", body=body)
 
-    def place_order(
-        self,
-        *,
-        tv_symbol: str,
-        side: str,               # "buy" | "sell"
-        order_type: str,         # "market" | "limit"
-        size: str,
-        reduce_only: bool = False,
-        client_oid: Optional[str] = None,
-        price: Optional[str] = None,
-        time_in_force: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        side_first = self._map_side_for_hedge(side, reduce_only)
-        return self._send_place_order(
-            tv_symbol=tv_symbol,
-            side=side_first,
-            order_type=order_type,
-            size=size,
+    def place_market_order(self, *, symbol: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
+        return self._place(
+            tv_symbol=symbol,
+            side=side,
+            order_type="market",
+            size=str(size),
             reduce_only=reduce_only,
-            client_oid=client_oid,
-            price=price,
-            time_in_force=time_in_force,
+            client_oid=f"siu-{int(time.time()*1000)}",
         )
 
-    # -------- EA helpers -------- #
-
+    # convenience
     def open_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(tv_symbol=symbol, side="buy",  order_type=order_type, size=size,
-                                reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open-l")
+        return self._place(tv_symbol=symbol, side="buy", order_type=order_type, size=size, reduce_only=False)
 
     def open_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(tv_symbol=symbol, side="sell", order_type=order_type, size=size,
-                                reduce_only=False, client_oid=f"tv-{int(time.time()*1000)}-open-s")
+        return self._place(tv_symbol=symbol, side="sell", order_type=order_type, size=size, reduce_only=False)
 
     def close_long(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(tv_symbol=symbol, side="sell", order_type=order_type, size=size,
-                                reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close-l")
+        return self._place(tv_symbol=symbol, side="sell", order_type=order_type, size=size, reduce_only=True)
 
     def close_short(self, symbol: str, size: str, order_type: str = "market") -> Dict[str, Any]:
-        return self.place_order(tv_symbol=symbol, side="buy",  order_type=order_type, size=size,
-                                reduce_only=True, client_oid=f"tv-{int(time.time()*1000)}-close-s")
+        return self._place(tv_symbol=symbol, side="buy", order_type=order_type, size=size, reduce_only=True)
